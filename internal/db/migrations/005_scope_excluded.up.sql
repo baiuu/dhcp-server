@@ -1,1 +1,0 @@
-ALTER TABLE scopes ADD COLUMN IF NOT EXISTS excluded_ips INET[] DEFAULT '{}';

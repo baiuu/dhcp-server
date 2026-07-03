@@ -1,1 +1,0 @@
-ALTER TABLE scopes DROP COLUMN IF EXISTS excluded_ips;

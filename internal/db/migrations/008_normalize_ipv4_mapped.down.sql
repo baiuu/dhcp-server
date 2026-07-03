@@ -1,2 +1,0 @@
--- Down migration intentionally left empty: re-converting plain IPv4 back to
--- IPv4-mapped IPv6 form is not necessary for correctness.
