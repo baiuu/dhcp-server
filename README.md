@@ -3,6 +3,8 @@
 > ⚠️ **平台支持声明：本项目仅支持 Linux 服务器部署。**
 >
 > DHCP 服务需要绑定特权端口（UDP 67/547）、发送/接收原始套接字和广播包，并依赖 systemd 进行服务管理。因此**不支持 Windows 和 macOS 生产部署**，仅适配 Linux（推荐 Ubuntu / Debian / RHEL / CentOS 等服务器发行版）。
+>
+> 🤖 **本项目代码由 [Kimi Code](https://kimi.moonshot.cn/) 辅助编写。**
 
 企业级 DHCPv4/v6 双栈服务器，基于 Go 开发，PostgreSQL 持久化，Active/Active DHCP Failover 多集群高可用，内嵌现代化 Web 管理后台，支持 Prometheus 监控与审计日志。
 
