@@ -1,0 +1,13 @@
+{
+    gopls {
+        ui.diagnostic.annotations {
+            bounds false,
+            escape false,
+            inline false,
+            nil false
+        },
+        build.env {
+            GOOS linux
+        }
+    }
+}

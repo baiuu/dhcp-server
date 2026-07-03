@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS v6_reservations;
+DROP INDEX IF EXISTS idx_v6_prefixes_scope_state;
+DROP INDEX IF EXISTS idx_v6_prefixes_prefix;
+DROP INDEX IF EXISTS idx_v6_prefixes_duid;
+DROP TABLE IF EXISTS v6_prefixes;
+DROP INDEX IF EXISTS idx_v6_leases_scope_state;
+DROP INDEX IF EXISTS idx_v6_leases_ip;
+DROP INDEX IF EXISTS idx_v6_leases_duid;
+DROP TABLE IF EXISTS v6_leases;
+ALTER TABLE scopes DROP COLUMN IF EXISTS prefix;
+ALTER TABLE scopes DROP COLUMN IF EXISTS v6;

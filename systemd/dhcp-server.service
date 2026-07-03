@@ -1,0 +1,21 @@
+[Unit]
+Description=Go DHCP Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+ExecStart=/opt/dhcp-server/build/dhcp-server -config=/opt/dhcp-server/configs/config.yaml
+Restart=always
+RestartSec=5
+WorkingDirectory=/opt/dhcp-server
+
+# Required for binding DHCP ports and sending raw/broadcast packets
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

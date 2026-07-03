@@ -1,0 +1,19 @@
+ALTER TABLE reservations ALTER COLUMN hostname DROP NOT NULL;
+ALTER TABLE reservations ALTER COLUMN description DROP NOT NULL;
+
+ALTER TABLE v6_reservations ALTER COLUMN hostname DROP NOT NULL;
+ALTER TABLE v6_reservations ALTER COLUMN description DROP NOT NULL;
+
+ALTER TABLE leases ALTER COLUMN hostname DROP NOT NULL;
+ALTER TABLE leases ALTER COLUMN client_id DROP NOT NULL;
+
+ALTER TABLE v6_leases ALTER COLUMN hostname DROP NOT NULL;
+
+ALTER TABLE mac_blacklist ALTER COLUMN reason DROP NOT NULL;
+
+ALTER TABLE reservation_groups ALTER COLUMN description DROP NOT NULL;
+
+ALTER TABLE ha_nodes ALTER COLUMN listen_addr DROP NOT NULL;
+ALTER TABLE ha_nodes ALTER COLUMN version DROP NOT NULL;
+
+ALTER TABLE scopes ALTER COLUMN domain_name DROP NOT NULL;

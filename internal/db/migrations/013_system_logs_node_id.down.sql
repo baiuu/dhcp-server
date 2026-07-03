@@ -1,0 +1,1 @@
+ALTER TABLE system_logs DROP COLUMN IF EXISTS node_id;

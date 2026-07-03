@@ -1,0 +1,32 @@
+server:
+  listen: "0.0.0.0:67"
+  v6_listen: "[::]:547"
+  # 用于广播/单播发送的本地接口，留空则使用第一个可用接口
+  interface: "eth0"
+  http_listen: "0.0.0.0:8080"
+
+database:
+  url: "postgres://dhcp:your-db-password@localhost:5432/dhcpdb?sslmode=disable"
+  max_conns: 20
+
+auth:
+  rsa_private_key: "configs/keys/jwt-private.pem"
+  rsa_public_key: "configs/keys/jwt-public.pem"
+  token_ttl: "24h"
+  # 首次启动时若用户表为空，且下面两项已配置，才自动创建默认管理员
+  # 生产环境请务必修改，避免使用默认账号
+  default_admin_username: "admin"
+  default_admin_password: "your-strong-password"
+
+cluster:
+  enabled: false
+  cluster_id: "cluster-1"
+  node_id: "node1"
+  # 本节点 DHCP 监听地址，用于集群节点注册和 UI 展示
+  listen_addr: "0.0.0.0:67"
+  heartbeat_interval: "5s"
+  node_timeout: "30s"
+  # 收到 Discover 后延迟多久回复 Offer。在多节点部署时，延迟较低的节点会优先
+  # 分配并写入数据库，延迟较高的节点在延迟结束后检查发现已有 offer 则跳过，
+  # 从而减少多 Offer。设为 0 则立即回复。
+  discover_reply_delay: "0s"

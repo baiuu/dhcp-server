@@ -1,0 +1,1 @@
+-- Down migration intentionally left empty.
