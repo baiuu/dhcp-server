@@ -48,6 +48,21 @@ func (d *DB) Migrate() error {
 		return fmt.Errorf("migrate instance: %w", err)
 	}
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		// The pre-merge schema used migrations 001..014; they were consolidated
+		// into a single idempotent 001_init. Databases created before the merge
+		// carry a schema_migrations version (e.g. 6) that no longer exists in
+		// the source files, which makes golang-migrate fail with "no migration
+		// found for version N". Their content is exactly the merged 001, so
+		// force-align the version to 1 and continue.
+		if strings.Contains(err.Error(), "no migration found for version") {
+			if ferr := m.Force(1); ferr != nil {
+				return fmt.Errorf("migrate force: %w", ferr)
+			}
+			if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+				return fmt.Errorf("migrate up: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("migrate up: %w", err)
 	}
 	return nil
