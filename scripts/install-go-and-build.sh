@@ -125,6 +125,10 @@ else
     echo "      Install Node.js or run 'yarn build' / 'npm run build' in internal/web/ui manually."
 fi
 
+# vite emptyOutDir removes internal/web/dist/.gitkeep; restore it so
+# go:embed keeps working on a fresh clone.
+touch "$PROJECT_DIR/internal/web/dist/.gitkeep"
+
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 BUILDTIME="${BUILDTIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 LDFLAGS="-X github.com/dhcp-server/dhcp-server/internal/buildinfo.Version=$VERSION -X github.com/dhcp-server/dhcp-server/internal/buildinfo.BuildTime=$BUILDTIME"

@@ -44,6 +44,8 @@ ui:
 		echo "ERROR: yarn or npm not found. Run 'sudo make setup' first."; \
 		exit 1; \
 	fi
+	@# vite emptyOutDir removes .gitkeep; restore it so go:embed keeps working on a fresh clone
+	@touch internal/web/dist/.gitkeep
 
 run: build
 	sudo $(BUILD_DIR)/$(BINARY) -config=configs/config.yaml
