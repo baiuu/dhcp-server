@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: internal/web/ui/package-lock.json
+
+      - name: Build web UI
+        working-directory: internal/web/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build binaries (linux/amd64, linux/arm64, static)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          BUILDTIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X github.com/dhcp-server/dhcp-server/internal/buildinfo.Version=$VERSION -X github.com/dhcp-server/dhcp-server/internal/buildinfo.BuildTime=$BUILDTIME"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "$LDFLAGS" -o build/dist/dhcp-server-linux-$arch ./cmd/dhcp-server
+          done
+
+      - name: Smoke test binaries
+        run: |
+          for arch in amd64 arm64; do
+            file build/dist/dhcp-server-linux-$arch
+          done
+
+      - name: Package archives
+        run: |
+          for arch in amd64 arm64; do
+            pkg=dhcp-server-linux-$arch
+            mkdir -p build/release/$pkg
+            cp build/dist/dhcp-server-linux-$arch build/release/$pkg/dhcp-server
+            cp -r configs build/release/$pkg/
+            cp -r scripts build/release/$pkg/
+            cp -r systemd build/release/$pkg/
+            cp README.md LICENSE build/release/$pkg/
+            tar -C build/release -czf build/release/$pkg.tar.gz $pkg
+          done
+          ls -lh build/release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/release/*.tar.gz
+          generate_release_notes: true

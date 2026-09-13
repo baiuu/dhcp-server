@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Go vet & test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dhcp
+          POSTGRES_PASSWORD: dhcp
+          POSTGRES_DB: dhcpdb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        env:
+          DATABASE_URL: postgres://dhcp:dhcp@localhost:5432/dhcpdb_test?sslmode=disable
+        run: go test ./...
+
+      - name: Build (Linux)
+        run: go build -ldflags "-X github.com/dhcp-server/dhcp-server/internal/buildinfo.Version=ci -X github.com/dhcp-server/dhcp-server/internal/buildinfo.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o build/dhcp-server ./cmd/dhcp-server
+
+  build-ui:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: internal/web/ui/package-lock.json
+
+      - name: Install & build
+        working-directory: internal/web/ui
+        run: |
+          npm ci
+          npm run build

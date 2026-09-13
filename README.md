@@ -1,5 +1,8 @@
 # Go DHCP 高可用数据库服务器
 
+[![CI](https://github.com/baiuu/dhcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/baiuu/dhcp-server/actions/workflows/ci.yml)
+[![Release](https://github.com/baiuu/dhcp-server/actions/workflows/release.yml/badge.svg)](https://github.com/baiuu/dhcp-server/actions/workflows/release.yml)
+
 > ⚠️ **平台支持声明：本项目仅支持 Linux 服务器部署。**
 >
 > DHCP 服务需要绑定特权端口（UDP 67/547）、发送/接收原始套接字和广播包，并依赖 systemd 进行服务管理。因此**不支持 Windows 和 macOS 生产部署**，仅适配 Linux（推荐 Ubuntu / Debian / RHEL / CentOS 等服务器发行版）。
@@ -23,44 +26,16 @@
 
 ## 快速开始
 
-### 环境要求
-
-- Linux 服务器（x86_64）
-- Go 1.26+、Node.js 22+、yarn（可由 `make setup` 自动安装）
-- PostgreSQL 14+（运行时依赖，需单独安装）
-
-### 1. 安装编译环境与数据库
-
-#### 1.1 安装编译环境（Go + Node.js + yarn）
-
-本项目**不依赖 apt/deb 包**，编译环境通过官方二进制包直接安装：
-
-```bash
-sudo make setup
-```
-
-该命令会自动下载并安装：
-- Go 1.26.x 到 `/usr/local/go`
-- Node.js 22.x 到 `/usr/local/node-v22.x.x-linux-x64`
-- yarn 到 Node.js 目录下
-
-安装版本可通过变量覆盖：
-
-```bash
-sudo make setup GO_VERSION=1.26.4 NODE_VERSION=22.16.0
-```
-
-#### 1.2 安装 PostgreSQL
-
-PostgreSQL 作为运行时数据库，仍需通过系统包管理器或容器安装：
+### 1. 安装 PostgreSQL（两种方式都需要）
 
 ```bash
 # Debian / Ubuntu
 sudo apt update
-sudo apt install -y postgresql postgresql-contrib curl openssl ssh-keygen
+sudo apt install -y postgresql postgresql-contrib
 
 # RHEL / CentOS / Rocky
-sudo dnf install -y postgresql-server postgresql-contrib curl openssl openssh-clients
+sudo dnf install -y postgresql-server postgresql-contrib
+sudo postgresql-setup --initdb && sudo systemctl enable --now postgresql
 ```
 
 ### 2. 初始化数据库
@@ -72,21 +47,44 @@ sudo -u postgres psql -c "CREATE USER dhcp WITH PASSWORD 'your-db-password';"
 sudo -u postgres psql -c "CREATE DATABASE dhcpdb OWNER dhcp;"
 ```
 
-### 3. 生成 JWT 密钥
+### 3. 部署程序
+
+#### 方式一：预编译包（推荐）
+
+从 [Releases](https://github.com/baiuu/dhcp-server/releases) 下载对应架构的压缩包（打 `v*` tag 时由 GitHub Actions 自动构建 linux/amd64 与 linux/arm64 静态二进制，无需任何编译环境）：
 
 ```bash
-./scripts/generate-jwt-keys.sh
+tar xzf dhcp-server-linux-amd64.tar.gz
+sudo mkdir -p /opt/dhcp-server
+sudo cp -r dhcp-server-linux-amd64/* /opt/dhcp-server/
 ```
 
-将在 `configs/keys/` 下生成 `jwt-private.pem` 和 `jwt-public.pem`。
+#### 方式二：源码编译
 
-### 4. 准备配置文件
+环境要求：Go 1.26+、Node.js 22+、yarn（均可由 `make setup` 通过官方二进制包自动安装，不依赖 apt/deb）。
 
 ```bash
-cp configs/config.example.yaml configs/config.yaml
+git clone https://github.com/baiuu/dhcp-server.git
+cd dhcp-server
+
+sudo make setup    # 安装 Go + Node.js + yarn 编译环境
+make build         # 构建 Web UI 并编译后端二进制
+sudo make install  # 安装到 /opt/dhcp-server 并配置 systemd
 ```
 
-编辑 `configs/config.yaml`，至少修改：
+安装前缀可自定义：`sudo make install INSTALL_PREFIX=/usr/local/dhcp-server`
+
+也可使用一键安装脚本 `sudo ./scripts/install-go-and-build.sh`。
+
+### 4. 生成 JWT 密钥并配置
+
+```bash
+sudo /opt/dhcp-server/scripts/generate-jwt-keys.sh
+sudo cp /opt/dhcp-server/configs/config.example.yaml /opt/dhcp-server/configs/config.yaml
+sudo nano /opt/dhcp-server/configs/config.yaml
+```
+
+至少修改：
 
 ```yaml
 database:
@@ -99,51 +97,16 @@ server:
   interface: "eth0"   # 替换为实际网卡名
 ```
 
-### 5. 编译（含 Web UI）
+### 5. 启动服务并访问
 
 ```bash
-make build
-```
-
-该命令会自动构建 Web UI 并编译后端二进制。`make ui` 可单独构建 Web UI。
-
-### 6. 安装并配置 systemd
-
-```bash
-sudo make install
-sudo /opt/dhcp-server/scripts/generate-jwt-keys.sh
-sudo cp /opt/dhcp-server/configs/config.example.yaml /opt/dhcp-server/configs/config.yaml
-# 编辑 /opt/dhcp-server/configs/config.yaml 填入真实数据库密码、网卡名等
+sudo systemctl daemon-reload
 sudo systemctl enable --now dhcp-server
 ```
 
-`make install` 默认安装到 `/opt/dhcp-server`，可通过 `INSTALL_PREFIX` 修改：
-
-```bash
-sudo make install INSTALL_PREFIX=/usr/local/dhcp-server
-```
-
-### 7. 直接运行（开发/测试）
-
-```bash
-sudo ./build/dhcp-server -config=configs/config.yaml
-```
-
-> 需要 root 或 `CAP_NET_BIND_SERVICE` + `CAP_NET_RAW` 能力。
-
-### 8. 访问 Web UI
-
 打开 http://服务器IP:8080，使用配置的管理员账号登录。
 
-### 一键安装脚本
-
-也可使用 `scripts/install-go-and-build.sh` 在目标 Linux 服务器上一键安装：
-
-```bash
-sudo ./scripts/install-go-and-build.sh
-# 或自带 Go 安装包
-sudo ./scripts/install-go-and-build.sh go1.26.4.linux-amd64.tar.gz
-```
+> 直接运行（开发/测试）：`sudo ./build/dhcp-server -config=configs/config.yaml`，需要 root 或 `CAP_NET_BIND_SERVICE` + `CAP_NET_RAW` 能力。
 
 ## 高可用多节点部署
 
