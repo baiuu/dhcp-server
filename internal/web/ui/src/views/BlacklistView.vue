@@ -12,7 +12,7 @@
         <el-table-column label="原因" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">{{ row.reason || '-' }}</template>
         </el-table-column>
-        <el-table-column label="创建时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="created_at" label="创建时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
         <el-table-column v-if="auth.role !== 'readonly'" label="操作" width="100" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>

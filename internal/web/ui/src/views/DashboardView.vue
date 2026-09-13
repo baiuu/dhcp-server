@@ -54,7 +54,7 @@
             <el-tag :type="stateType(row.state)" size="small" effect="dark">{{ row.state }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="过期时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="ends_at" label="过期时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
       </el-table>
     </el-card>
   </div>

@@ -14,7 +14,7 @@
             <el-tag :type="row.role === 'admin' ? 'primary' : 'info'" size="small" effect="dark">{{ row.role }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="创建时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="created_at" label="创建时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
         <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="Key" @click="openPassword(row.username)">改密</el-button>

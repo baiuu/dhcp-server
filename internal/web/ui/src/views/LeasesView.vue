@@ -40,7 +40,7 @@
       <div class="pagination-bar">
         <el-pagination
           background
-          small
+          size="small"
           layout="prev, pager, next"
           v-model:current-page="group.page"
           :page-size="PAGE_SIZE"

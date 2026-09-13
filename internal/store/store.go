@@ -15,6 +15,38 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// offerTimeoutSeconds is how long an OFFERED lease is reserved for a client.
+// The client is expected to complete REQUEST/ACK within this window; leases
+// that stay in the offered state beyond it are recycled so the address can be
+// handed out again.
+const offerTimeoutSeconds = 120
+
+// declineQuarantineSeconds is how long an address stays out of the allocation
+// pool after a client declines it (typically because the address is really in
+// use by a statically configured device). Without this the server would hand
+// the same conflicting address to the next client and loop.
+const declineQuarantineSeconds = 3600
+
+// leaseBlocksReuse reports whether a lease still occupies its address: an
+// active lease that has not expired, an offered lease still inside the offer
+// window, or a declined lease still inside the quarantine window. Stale
+// leases do not block address reuse.
+func leaseBlocksReuse(state models.LeaseState, offeredAt *time.Time, startsAt, endsAt, updatedAt, now time.Time) bool {
+	switch state {
+	case models.LeaseActive:
+		return endsAt.After(now)
+	case models.LeaseOffered:
+		since := startsAt
+		if offeredAt != nil {
+			since = *offeredAt
+		}
+		return since.Add(offerTimeoutSeconds * time.Second).After(now)
+	case models.LeaseDeclined:
+		return updatedAt.Add(declineQuarantineSeconds * time.Second).After(now)
+	}
+	return false
+}
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -40,6 +72,25 @@ func (s *Store) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// ---------- Server State ----------
+
+func (s *Store) GetServerState(ctx context.Context, key string) (string, error) {
+	var v string
+	err := s.pool.QueryRow(ctx, `SELECT value FROM server_state WHERE key=$1`, key).Scan(&v)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s *Store) SetServerState(ctx context.Context, key, value string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO server_state (key, value, updated_at) VALUES ($1, $2, NOW())
+		ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+	`, key, value)
+	return err
 }
 
 // ---------- Users ----------
@@ -656,7 +707,7 @@ func (s *Store) CreateOrUpdateLease(ctx context.Context, lease *models.Lease) er
 }
 
 func (s *Store) UpdateLeaseState(ctx context.Context, id string, state models.LeaseState) error {
-	_, err := s.pool.Exec(ctx, `UPDATE leases SET state=$2, updated_at=$3 WHERE id=$1`, id, string(state), time.Now().UTC())
+	_, err := s.pool.Exec(ctx, `UPDATE leases SET state=$2, updated_at=NOW() WHERE id=$1`, id, string(state))
 	return err
 }
 
@@ -715,8 +766,11 @@ func (s *Store) ListLeasesByScopePaged(ctx context.Context, scopeID string, offs
 func (s *Store) ListActiveLeases(ctx context.Context) ([]*models.Lease, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, scope_id, mac_addr, ip_addr, hostname, client_id, state, offered_at, starts_at, ends_at, created_at, updated_at
-		FROM leases WHERE state IN ('active', 'offered') ORDER BY ends_at
-	`)
+		FROM leases
+		WHERE (state='active' AND ends_at > NOW())
+		   OR (state='offered' AND COALESCE(offered_at, starts_at) > NOW() - make_interval(secs => $1))
+		ORDER BY ends_at
+	`, offerTimeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -732,11 +786,14 @@ func (s *Store) ListActiveLeases(ctx context.Context) ([]*models.Lease, error) {
 	return leases, rows.Err()
 }
 
-func (s *Store) ReleaseExpiredLeases(ctx context.Context, before time.Time) error {
+// ReleaseExpiredLeases sweeps expired leases using the database clock, so
+// nodes with skewed local clocks cannot recycle each other's fresh offers.
+func (s *Store) ReleaseExpiredLeases(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE leases SET state='expired', updated_at=$2
-		WHERE state='active' AND ends_at < $1
-	`, before, time.Now().UTC())
+		UPDATE leases SET state='expired', updated_at=NOW()
+		WHERE (state='active' AND ends_at < NOW())
+		   OR (state='offered' AND COALESCE(offered_at, starts_at) < NOW() - make_interval(secs => $1))
+	`, offerTimeoutSeconds)
 	return err
 }
 
@@ -767,6 +824,23 @@ func (s *Store) SearchLeasesByMAC(ctx context.Context, mac string) ([]*models.Le
 func (s *Store) DeleteLease(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM leases WHERE id=$1`, id)
 	return err
+}
+
+// UpdateLeaseStateByMACIP conditionally transitions a lease to the given
+// state and reports whether a row was actually updated. A single UPDATE
+// avoids the read-then-write race where the row could have been reassigned
+// to another client in between, and the state guard prevents reactivating
+// or overwriting rows that are no longer live.
+func (s *Store) UpdateLeaseStateByMACIP(ctx context.Context, scopeID, mac string, ip net.IP, state models.LeaseState) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE leases SET state=$4, updated_at=NOW()
+		WHERE scope_id=$1 AND mac_addr=$2 AND ip_addr=regexp_replace(host($3), '^::ffff:', '')::inet
+		  AND state IN ('active','offered')
+	`, scopeID, mac, ip, string(state))
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // CleanupExpiredLeases removes v4/v6 leases (and delegated prefixes) whose
@@ -940,11 +1014,17 @@ func (s *Store) GetHANode(ctx context.Context, nodeID string) (*models.HANode, e
 	return &n, nil
 }
 
-func (s *Store) ListHANodesByCluster(ctx context.Context, clusterID string) ([]*models.HANode, error) {
+// ListHANodesByCluster returns cluster nodes with the healthy flag computed
+// from last_seen: a node is healthy only when its last heartbeat is fresher
+// than offlineAfterSeconds. The stored healthy column is written by the node
+// itself and goes stale when it dies, so it cannot be trusted directly.
+func (s *Store) ListHANodesByCluster(ctx context.Context, clusterID string, offlineAfterSeconds int) ([]*models.HANode, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, cluster_id, node_id, role, listen_addr, version, healthy, last_seen, created_at, updated_at
+		SELECT id, cluster_id, node_id, role, listen_addr, version,
+		       (last_seen > NOW() - make_interval(secs => $2)) AS healthy,
+		       last_seen, created_at, updated_at
 		FROM ha_nodes WHERE cluster_id=$1 ORDER BY node_id
-	`, clusterID)
+	`, clusterID, offlineAfterSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,7 +1106,7 @@ func (s *Store) CreateOrUpdateV6Lease(ctx context.Context, lease *models.V6Lease
 }
 
 func (s *Store) UpdateV6LeaseState(ctx context.Context, id string, state models.LeaseState) error {
-	_, err := s.pool.Exec(ctx, `UPDATE v6_leases SET state=$2, updated_at=$3 WHERE id=$1`, id, string(state), time.Now().UTC())
+	_, err := s.pool.Exec(ctx, `UPDATE v6_leases SET state=$2, updated_at=NOW() WHERE id=$1`, id, string(state))
 	return err
 }
 
@@ -1085,8 +1165,11 @@ func (s *Store) ListV6LeasesByScopePaged(ctx context.Context, scopeID string, of
 func (s *Store) ListActiveV6Leases(ctx context.Context) ([]*models.V6Lease, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, scope_id, duid, iaid, ip_addr, hostname, state, offered_at, starts_at, ends_at, created_at, updated_at
-		FROM v6_leases WHERE state IN ('active', 'offered') ORDER BY ends_at
-	`)
+		FROM v6_leases
+		WHERE (state='active' AND ends_at > NOW())
+		   OR (state='offered' AND COALESCE(offered_at, starts_at) > NOW() - make_interval(secs => $1))
+		ORDER BY ends_at
+	`, offerTimeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -1102,11 +1185,23 @@ func (s *Store) ListActiveV6Leases(ctx context.Context) ([]*models.V6Lease, erro
 	return leases, rows.Err()
 }
 
-func (s *Store) ReleaseExpiredV6Leases(ctx context.Context, before time.Time) error {
+func (s *Store) ReleaseExpiredV6Leases(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE v6_leases SET state='expired', updated_at=$2
-		WHERE state='active' AND ends_at < $1
-	`, before, time.Now().UTC())
+		UPDATE v6_leases SET state='expired', updated_at=NOW()
+		WHERE (state='active' AND ends_at < NOW())
+		   OR (state='offered' AND COALESCE(offered_at, starts_at) < NOW() - make_interval(secs => $1))
+	`, offerTimeoutSeconds)
+	return err
+}
+
+// ReleaseExpiredV6Prefixes marks expired delegated prefixes. v6_prefixes has
+// no offered_at column, so the offer window is measured from starts_at.
+func (s *Store) ReleaseExpiredV6Prefixes(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE v6_prefixes SET state='expired', updated_at=NOW()
+		WHERE (state='active' AND ends_at < NOW())
+		   OR (state='offered' AND starts_at < NOW() - make_interval(secs => $1))
+	`, offerTimeoutSeconds)
 	return err
 }
 
@@ -1371,7 +1466,7 @@ func (s *Store) CreateOrUpdateV6Prefix(ctx context.Context, p *models.V6Prefix) 
 }
 
 func (s *Store) UpdateV6PrefixState(ctx context.Context, id string, state models.LeaseState) error {
-	_, err := s.pool.Exec(ctx, `UPDATE v6_prefixes SET state=$2, updated_at=$3 WHERE id=$1`, id, string(state), time.Now().UTC())
+	_, err := s.pool.Exec(ctx, `UPDATE v6_prefixes SET state=$2, updated_at=NOW() WHERE id=$1`, id, string(state))
 	return err
 }
 
@@ -1482,7 +1577,12 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 			return err
 		}
 
-		now := time.Now().UTC()
+		// Use the database clock so multi-node deployments with skewed local
+		// clocks agree on lease timestamps and offer/quarantine windows.
+		var now time.Time
+		if err := tx.QueryRow(ctx, "SELECT NOW()").Scan(&now); err != nil {
+			return err
+		}
 		endsAt := now.Add(time.Duration(leaseTime) * time.Second)
 
 		// 1. Find reservation (always wins when present).
@@ -1496,13 +1596,30 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 		if err != nil {
 			return err
 		}
+		// declinedIP remembers an in-quarantine address this client declined,
+		// so the stale-row cleanup below cannot silently lift the quarantine
+		// and hand the same conflicting address back.
+		var declinedIP net.IP
 		if existing != nil {
 			if (existing.State == models.LeaseActive || existing.State == models.LeaseOffered) && ipInRange(existing.IPAddr, scope.StartIP, scope.EndIP) {
-				if res == nil || ipKey(existing.IPAddr) == ipKey(res.IPAddr) {
+				// If the IP of the existing lease is now reserved for another
+				// client, this MAC must give it up and get a pool address.
+				resByIP, err := getReservationByIPTx(ctx, tx, scope.ID, existing.IPAddr)
+				if err != nil {
+					return err
+				}
+				reservedForOther := resByIP != nil && resByIP.MACAddr != mac
+				if !reservedForOther && (res == nil || ipKey(existing.IPAddr) == ipKey(res.IPAddr)) {
 					existing.Hostname = hostname
 					existing.ClientID = clientID
-					existing.State = models.LeaseOffered
-					existing.OfferedAt = &now
+					// A confirmed (active) lease must not be demoted to offered
+					// by a bare Discover: if the client never follows up with a
+					// Request, the offer timeout would recycle an address the
+					// client still legitimately holds.
+					if existing.State != models.LeaseActive {
+						existing.State = models.LeaseOffered
+						existing.OfferedAt = &now
+					}
 					existing.StartsAt = now
 					existing.EndsAt = endsAt
 					existing.UpdatedAt = now
@@ -1510,6 +1627,9 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 					return saveLeaseTx(ctx, tx, lease)
 				}
 				// Reservation exists but points to a different IP; drop the old lease.
+			}
+			if existing.State == models.LeaseDeclined && leaseBlocksReuse(existing.State, existing.OfferedAt, existing.StartsAt, existing.EndsAt, existing.UpdatedAt, now) {
+				declinedIP = existing.IPAddr
 			}
 			// Stale or out-of-range lease for this MAC; remove all rows before assigning a new IP.
 			if err := deleteLeasesByMACTx(ctx, tx, scope.ID, mac); err != nil {
@@ -1519,7 +1639,7 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 
 		// 3. Reservation wins for new or corrected leases.
 		if res != nil {
-			if err := ensureIPAvailableTx(ctx, tx, scope.ID, res.IPAddr, mac); err != nil {
+			if err := ensureIPAvailableTx(ctx, tx, scope.ID, res.IPAddr, mac, now); err != nil {
 				return err
 			}
 			lease = &models.Lease{
@@ -1543,13 +1663,20 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 		// For migration scenarios we also allow IPs inside the subnet but outside
 		// the configured start/end range, as long as they are not excluded/gateway/DNS.
 		if preferred != nil && scope.Subnet != nil && scope.Subnet.Contains(preferred) {
+			// Never hand out an address that is reserved for another client,
+			// even when the client explicitly requests it (option 50 / ciaddr).
+			resByIP, err := getReservationByIPTx(ctx, tx, scope.ID, preferred)
+			if err != nil {
+				return err
+			}
+			reservedForOther := resByIP != nil && resByIP.MACAddr != mac
 			occupied, err := getLeaseByIPTx(ctx, tx, scope.ID, preferred)
 			if err != nil {
 				return err
 			}
-			usable := occupied == nil || occupied.MACAddr == mac || (occupied.State != models.LeaseActive && occupied.State != models.LeaseOffered)
-			inRange := ipInRange(preferred, scope.StartIP, scope.EndIP)
-			if usable && (inRange || !isExcludedIP(scope, preferred)) {
+			usable := !reservedForOther && (occupied == nil || occupied.MACAddr == mac || !leaseBlocksReuse(occupied.State, occupied.OfferedAt, occupied.StartsAt, occupied.EndsAt, occupied.UpdatedAt, now))
+			quarantined := declinedIP != nil && preferred.Equal(declinedIP)
+			if usable && !quarantined && !isExcludedIP(scope, preferred) {
 				if occupied != nil && occupied.MACAddr != mac {
 					if err := deleteLeaseTx(ctx, tx, occupied.ID); err != nil {
 						return err
@@ -1574,7 +1701,7 @@ func (s *Store) AllocateV4Lease(ctx context.Context, scope *models.Scope, mac, c
 		}
 
 		// 4. Allocate from the pool.
-		ip, err := allocateIPv4Tx(ctx, tx, scope)
+		ip, err := allocateIPv4Tx(ctx, tx, scope, declinedIP)
 		if err != nil {
 			return err
 		}
@@ -1616,7 +1743,11 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 			return err
 		}
 
-		now := time.Now().UTC()
+		// Database clock; see AllocateV4Lease for rationale.
+		var now time.Time
+		if err := tx.QueryRow(ctx, "SELECT NOW()").Scan(&now); err != nil {
+			return err
+		}
 		endsAt := now.Add(time.Duration(leaseTime) * time.Second)
 
 		// 1. Find reservation (always wins when present).
@@ -1630,12 +1761,25 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 		if err != nil {
 			return err
 		}
+		// declinedIP remembers an in-quarantine address this client declined;
+		// see the IPv4 path for rationale.
+		var declinedIP net.IP
 		if existing != nil {
 			if (existing.State == models.LeaseActive || existing.State == models.LeaseOffered) && ipInRange(existing.IPAddr, scope.StartIP, scope.EndIP) {
-				if res == nil || ipKey(existing.IPAddr) == ipKey(res.IPAddr) {
+				// If the IP of the existing lease is now reserved for another
+				// client, this DUID must give it up and get a pool address.
+				resByIP, err := getV6ReservationByIPTx(ctx, tx, scope.ID, existing.IPAddr)
+				if err != nil {
+					return err
+				}
+				reservedForOther := resByIP != nil && resByIP.DUID != duid
+				if !reservedForOther && (res == nil || ipKey(existing.IPAddr) == ipKey(res.IPAddr)) {
 					existing.Hostname = hostname
-					existing.State = models.LeaseOffered
-					existing.OfferedAt = &now
+					// Keep active leases active; see the IPv4 path for rationale.
+					if existing.State != models.LeaseActive {
+						existing.State = models.LeaseOffered
+						existing.OfferedAt = &now
+					}
 					existing.StartsAt = now
 					existing.EndsAt = endsAt
 					existing.UpdatedAt = now
@@ -1643,6 +1787,9 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 					return saveV6LeaseTx(ctx, tx, lease)
 				}
 				// Reservation exists but points to a different IP; drop the old lease.
+			}
+			if existing.State == models.LeaseDeclined && leaseBlocksReuse(existing.State, existing.OfferedAt, existing.StartsAt, existing.EndsAt, existing.UpdatedAt, now) {
+				declinedIP = existing.IPAddr
 			}
 			// Stale or out-of-range lease for this DUID/IAID; remove all rows before assigning a new IP.
 			if err := deleteV6LeasesByDUIDTx(ctx, tx, scope.ID, duid, iaid); err != nil {
@@ -1652,7 +1799,7 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 
 		// 3. Reservation wins for new or corrected leases.
 		if res != nil {
-			if err := ensureV6IPAvailableTx(ctx, tx, scope.ID, res.IPAddr, duid); err != nil {
+			if err := ensureV6IPAvailableTx(ctx, tx, scope.ID, res.IPAddr, duid, now); err != nil {
 				return err
 			}
 			lease = &models.V6Lease{
@@ -1676,13 +1823,20 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 		// For migration scenarios we also allow IPs inside the subnet but outside
 		// the configured start/end range, as long as they are not excluded/gateway/DNS.
 		if preferred != nil && scope.Subnet != nil && scope.Subnet.Contains(preferred) {
+			// Never hand out an address that is reserved for another client,
+			// even when the client explicitly requests it.
+			resByIP, err := getV6ReservationByIPTx(ctx, tx, scope.ID, preferred)
+			if err != nil {
+				return err
+			}
+			reservedForOther := resByIP != nil && resByIP.DUID != duid
 			occupied, err := getV6LeaseByIPTx(ctx, tx, scope.ID, preferred)
 			if err != nil {
 				return err
 			}
-			usable := occupied == nil || occupied.DUID == duid || (occupied.State != models.LeaseActive && occupied.State != models.LeaseOffered)
-			inRange := ipInRange(preferred, scope.StartIP, scope.EndIP)
-			if usable && (inRange || !isExcludedIP(scope, preferred)) {
+			usable := !reservedForOther && (occupied == nil || occupied.DUID == duid || !leaseBlocksReuse(occupied.State, occupied.OfferedAt, occupied.StartsAt, occupied.EndsAt, occupied.UpdatedAt, now))
+			quarantined := declinedIP != nil && preferred.Equal(declinedIP)
+			if usable && !quarantined && !isExcludedIP(scope, preferred) {
 				if occupied != nil && occupied.DUID != duid {
 					if err := deleteV6LeaseTx(ctx, tx, occupied.ID); err != nil {
 						return err
@@ -1707,7 +1861,7 @@ func (s *Store) AllocateV6Lease(ctx context.Context, scope *models.Scope, duid, 
 		}
 
 		// 4. Allocate from the pool.
-		ip, err := allocateIPv6Tx(ctx, tx, scope)
+		ip, err := allocateIPv6Tx(ctx, tx, scope, declinedIP)
 		if err != nil {
 			return err
 		}
@@ -1749,16 +1903,23 @@ func (s *Store) AllocateV6Prefix(ctx context.Context, scope *models.Scope, duid,
 			return err
 		}
 
-		now := time.Now().UTC()
+		// Database clock; see AllocateV4Lease for rationale.
+		var now time.Time
+		if err := tx.QueryRow(ctx, "SELECT NOW()").Scan(&now); err != nil {
+			return err
+		}
 		endsAt := now.Add(time.Duration(leaseTime) * time.Second)
 
-		// Reuse existing active/offered prefix for this DUID/IAID.
+		// Reuse existing active/offered prefix for this DUID/IAID, as long as
+		// it still belongs to the configured prefix pool.
 		existing, err := getV6PrefixByDUIDTx(ctx, tx, scope.ID, duid, iaid)
 		if err != nil {
 			return err
 		}
-		if existing != nil && (existing.State == models.LeaseActive || existing.State == models.LeaseOffered) {
-			existing.State = models.LeaseOffered
+		if existing != nil && (existing.State == models.LeaseActive || existing.State == models.LeaseOffered) && scope.Prefix != nil && scope.Prefix.Contains(existing.Prefix.IP) {
+			if existing.State != models.LeaseActive {
+				existing.State = models.LeaseOffered
+			}
 			existing.PreferredLifetime = leaseTime
 			existing.ValidLifetime = leaseTime
 			existing.StartsAt = now
@@ -1799,6 +1960,30 @@ func getReservationByMACTx(ctx context.Context, tx pgx.Tx, scopeID, mac string) 
 		FROM reservations WHERE scope_id=$1 AND mac_addr=$2
 	`, scopeID, mac)
 	r, err := scanReservation(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return r, err
+}
+
+func getReservationByIPTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP) (*models.Reservation, error) {
+	row := tx.QueryRow(ctx, `
+		SELECT id, scope_id, group_id, mac_addr, ip_addr, hostname, description, options, created_at, updated_at
+		FROM reservations WHERE scope_id=$1 AND ip_addr=regexp_replace(host($2), '^::ffff:', '')::inet
+	`, scopeID, ip)
+	r, err := scanReservation(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return r, err
+}
+
+func getV6ReservationByIPTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP) (*models.V6Reservation, error) {
+	row := tx.QueryRow(ctx, `
+		SELECT id, scope_id, group_id, duid, ip_addr, hostname, description, options, created_at, updated_at
+		FROM v6_reservations WHERE scope_id=$1 AND ip_addr=regexp_replace(host($2), '^::ffff:', '')::inet
+	`, scopeID, ip)
+	r, err := scanV6Reservation(row)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -1856,7 +2041,7 @@ func deleteLeasesByMACTx(ctx context.Context, tx pgx.Tx, scopeID, mac string) er
 	return err
 }
 
-func ensureIPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP, mac string) error {
+func ensureIPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP, mac string, now time.Time) error {
 	existing, err := getLeaseByIPTx(ctx, tx, scopeID, ip)
 	if err != nil {
 		return err
@@ -1867,16 +2052,20 @@ func ensureIPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.
 	if existing.MACAddr == mac {
 		return nil
 	}
-	if existing.State == models.LeaseActive || existing.State == models.LeaseOffered {
+	if leaseBlocksReuse(existing.State, existing.OfferedAt, existing.StartsAt, existing.EndsAt, existing.UpdatedAt, now) {
 		return fmt.Errorf("reservation ip %s in use by %s (state %s)", ip, existing.MACAddr, existing.State)
 	}
 	return deleteLeaseTx(ctx, tx, existing.ID)
 }
 
-func allocateIPv4Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP, error) {
+func allocateIPv4Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope, extraExcluded ...net.IP) (net.IP, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT ip_addr, state FROM leases WHERE scope_id=$1
-	`, scope.ID)
+		SELECT ip_addr, state FROM leases
+		WHERE scope_id=$1
+		  AND ((state='active' AND ends_at > NOW())
+		       OR (state='offered' AND COALESCE(offered_at, starts_at) > NOW() - make_interval(secs => $2))
+		       OR (state='declined' AND updated_at > NOW() - make_interval(secs => $3)))
+	`, scope.ID, offerTimeoutSeconds, declineQuarantineSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -1888,7 +2077,7 @@ func allocateIPv4Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP
 		if err := rows.Scan(&ip, &state); err != nil {
 			return nil, err
 		}
-		if state == string(models.LeaseActive) || state == string(models.LeaseOffered) {
+		if state == string(models.LeaseActive) || state == string(models.LeaseOffered) || state == string(models.LeaseDeclined) {
 			used[ipKey(ip)] = true
 		}
 	}
@@ -1914,6 +2103,19 @@ func allocateIPv4Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP
 
 	for _, ip := range scope.ExcludedIPs {
 		used[ipKey(ip)] = true
+	}
+	// Gateway and DNS addresses must never be handed out, even when the pool
+	// range covers them and the admin forgot to exclude them.
+	for _, ip := range scope.Gateway {
+		used[ipKey(ip)] = true
+	}
+	for _, ip := range scope.DNS {
+		used[ipKey(ip)] = true
+	}
+	for _, ip := range extraExcluded {
+		if ip != nil {
+			used[ipKey(ip)] = true
+		}
 	}
 
 	start := ipToUint32(scope.StartIP.To4())
@@ -1994,7 +2196,7 @@ func deleteV6LeasesByDUIDTx(ctx context.Context, tx pgx.Tx, scopeID, duid, iaid 
 	return err
 }
 
-func ensureV6IPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP, duid string) error {
+func ensureV6IPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip net.IP, duid string, now time.Time) error {
 	existing, err := getV6LeaseByIPTx(ctx, tx, scopeID, ip)
 	if err != nil {
 		return err
@@ -2005,14 +2207,20 @@ func ensureV6IPAvailableTx(ctx context.Context, tx pgx.Tx, scopeID string, ip ne
 	if existing.DUID == duid {
 		return nil
 	}
-	if existing.State == models.LeaseActive || existing.State == models.LeaseOffered {
+	if leaseBlocksReuse(existing.State, existing.OfferedAt, existing.StartsAt, existing.EndsAt, existing.UpdatedAt, now) {
 		return fmt.Errorf("reservation ip %s in use", ip)
 	}
 	return deleteV6LeaseTx(ctx, tx, existing.ID)
 }
 
-func allocateIPv6Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP, error) {
-	rows, err := tx.Query(ctx, `SELECT ip_addr, state FROM v6_leases WHERE scope_id=$1`, scope.ID)
+func allocateIPv6Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope, extraExcluded ...net.IP) (net.IP, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT ip_addr, state FROM v6_leases
+		WHERE scope_id=$1
+		  AND ((state='active' AND ends_at > NOW())
+		       OR (state='offered' AND COALESCE(offered_at, starts_at) > NOW() - make_interval(secs => $2))
+		       OR (state='declined' AND updated_at > NOW() - make_interval(secs => $3)))
+	`, scope.ID, offerTimeoutSeconds, declineQuarantineSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -2024,7 +2232,7 @@ func allocateIPv6Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP
 		if err := rows.Scan(&ip, &state); err != nil {
 			return nil, err
 		}
-		if state == string(models.LeaseActive) || state == string(models.LeaseOffered) {
+		if state == string(models.LeaseActive) || state == string(models.LeaseOffered) || state == string(models.LeaseDeclined) {
 			used[ipKey(ip)] = true
 		}
 	}
@@ -2046,6 +2254,23 @@ func allocateIPv6Tx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (net.IP
 	}
 	if err := resRows.Err(); err != nil {
 		return nil, err
+	}
+
+	// Same protections as the IPv4 pool: excluded, infrastructure and
+	// quarantined addresses are never handed out.
+	for _, ip := range scope.ExcludedIPs {
+		used[ipKey(ip)] = true
+	}
+	for _, ip := range scope.Gateway {
+		used[ipKey(ip)] = true
+	}
+	for _, ip := range scope.DNS {
+		used[ipKey(ip)] = true
+	}
+	for _, ip := range extraExcluded {
+		if ip != nil {
+			used[ipKey(ip)] = true
+		}
 	}
 
 	start := ipToUint128(scope.StartIP.To16())
@@ -2100,9 +2325,18 @@ func allocatePrefixTx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (*net
 	if delegatedLen <= parentLen {
 		return nil, fmt.Errorf("delegated prefix length must be larger than parent")
 	}
-	count := 1 << (delegatedLen - parentLen)
+	subnetBits := delegatedLen - parentLen
+	if subnetBits > 48 {
+		return nil, fmt.Errorf("prefix pool too large: /%d into /%d produces 2^%d subnets", parentLen, delegatedLen, subnetBits)
+	}
+	count := uint64(1) << subnetBits
 
-	rows, err := tx.Query(ctx, `SELECT prefix, state FROM v6_prefixes WHERE scope_id=$1`, scope.ID)
+	rows, err := tx.Query(ctx, `
+		SELECT prefix, state FROM v6_prefixes
+		WHERE scope_id=$1
+		  AND ((state='active' AND ends_at > NOW())
+		       OR (state='offered' AND starts_at > NOW() - make_interval(secs => $2)))
+	`, scope.ID, offerTimeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -2123,17 +2357,39 @@ func allocatePrefixTx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (*net
 	}
 
 	base := ipToUint128(scope.Prefix.IP.To16())
-	step := uint64(1) << (delegatedLen - parentLen)
-	for i := 0; i < count; i++ {
-		ip := uint128ToIP(ipAddN(base, uint64(i)*step))
-		ip[len(ip)-1] = 0
+	for i := uint64(0); i < count; i++ {
+		ip := uint128ToIP(prefixCandidate(base, delegatedLen, i))
 		candidate := &net.IPNet{IP: ip, Mask: net.CIDRMask(delegatedLen, 128)}
 		if used[candidate.String()] {
 			continue
 		}
+		// The candidate is free of active occupants; purge any stale rows
+		// (released/expired/timed-out offers) so the INSERT below does not
+		// trip the UNIQUE(scope_id, prefix) constraint.
+		if _, err := tx.Exec(ctx, `DELETE FROM v6_prefixes WHERE scope_id=$1 AND prefix=$2`, scope.ID, candidate); err != nil {
+			return nil, err
+		}
 		return candidate, nil
 	}
 	return nil, fmt.Errorf("no available prefix")
+}
+
+// prefixCandidate returns base advanced by i sub-prefixes of the given
+// delegated length, i.e. base + i * 2^(128-delegatedLen) in 128-bit space.
+// The result is always a canonical network address for the delegated length.
+func prefixCandidate(base *bigInt128, delegatedLen int, i uint64) *bigInt128 {
+	shift := 128 - delegatedLen
+	out := &bigInt128{hi: base.hi, lo: base.lo}
+	if shift >= 64 {
+		out.hi += i << (shift - 64)
+		return out
+	}
+	out.hi += i >> shift
+	out.lo += i << (64 - shift)
+	if out.lo < base.lo {
+		out.hi++
+	}
+	return out
 }
 
 // ---------- IP helpers duplicated from dhcp packages for store use ----------

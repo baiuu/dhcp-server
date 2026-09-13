@@ -10,7 +10,7 @@
       <el-table :data="groups" size="default" stripe empty-text="暂无配置组">
         <el-table-column prop="name" label="名称" min-width="160" />
         <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
-        <el-table-column label="更新时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="updated_at" label="更新时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
         <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
             <el-button v-if="auth.role !== 'readonly'" size="small" :icon="Edit" @click="openForm(row)">编辑</el-button>

@@ -5,7 +5,7 @@
     </div>
     <el-card shadow="hover" v-loading="loading">
       <el-table :data="logs" size="default" stripe empty-text="暂无日志">
-        <el-table-column label="时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="created_at" label="时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
         <el-table-column prop="username" label="用户" width="140" />
         <el-table-column label="动作" width="120">
           <template #default="{ row }">

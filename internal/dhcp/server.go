@@ -77,10 +77,11 @@ type Server struct {
 }
 
 type pendingDiscover struct {
-	req   *Packet
-	addr  *net.UDPAddr
-	ctx   context.Context
-	timer *time.Timer
+	req    *Packet
+	addr   *net.UDPAddr
+	ctx    context.Context
+	cancel context.CancelFunc
+	timer  *time.Timer
 }
 
 func NewServer(cfg *config.Config, s *store.Store, logger *slog.Logger) *Server {
@@ -101,21 +102,27 @@ func htons(v uint16) uint16 {
 const discoverRelayWait = 60 * time.Millisecond
 
 func (s *Server) schedulePendingDiscover(ctx context.Context, req *Packet, addr *net.UDPAddr, mac string) {
+	// The packet handler's context is cancelled as soon as handlePacket
+	// returns; derive an independent one that survives until the timer fires.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	if existing, ok := s.pending[mac]; ok {
 		// Already buffering a direct Discover for this client; keep the newer one.
 		existing.timer.Stop()
+		existing.cancel()
 		existing.req = req
 		existing.addr = addr
 		existing.ctx = ctx
+		existing.cancel = cancel
 		existing.timer = time.AfterFunc(discoverRelayWait, func() { s.firePendingDiscover(mac) })
 		return
 	}
 	pd := &pendingDiscover{
-		req:  req,
-		addr: addr,
-		ctx:  ctx,
+		req:    req,
+		addr:   addr,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	pd.timer = time.AfterFunc(discoverRelayWait, func() { s.firePendingDiscover(mac) })
 	s.pending[mac] = pd
@@ -127,6 +134,7 @@ func (s *Server) cancelPendingDiscover(mac string) bool {
 	existing, ok := s.pending[mac]
 	if ok {
 		existing.timer.Stop()
+		existing.cancel()
 		delete(s.pending, mac)
 	}
 	return ok
@@ -142,6 +150,7 @@ func (s *Server) firePendingDiscover(mac string) {
 	if !ok {
 		return
 	}
+	defer pd.cancel()
 	s.processDiscover(pd.ctx, pd.req, pd.addr)
 }
 
@@ -222,7 +231,7 @@ func (s *Server) refreshLoop(ctx context.Context) {
 		case <-s.quit:
 			return
 		case <-ticker.C:
-			if err := s.store.ReleaseExpiredLeases(ctx, time.Now().UTC()); err != nil {
+			if err := s.store.ReleaseExpiredLeases(ctx); err != nil {
 				s.logger.Error("release expired leases", "err", err)
 			}
 			if err := s.reloadScopes(ctx); err != nil {
@@ -398,11 +407,19 @@ func (s *Server) processDiscover(ctx context.Context, req *Packet, addr *net.UDP
 	reply := ReplyFromRequest(req, DHCPOffer)
 	reply.YIAddr = lease.IPAddr
 	s.setServerIdentifier(reply, req)
-	s.applyOptions(req, reply, scope, reservation, groupOpts)
+	s.applyOptions(req, reply, scope, reservation, groupOpts, leaseTime)
 	s.sendReply(reply, addr)
 }
 
 func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAddr) {
+	// RFC 2131 §4.3.2: a Request carrying a server-identifier that is not
+	// ours must be silently ignored. This check must come before any NAK
+	// path, otherwise we would NAK transactions meant for another server
+	// and abort the client's legitimate attempt.
+	if serverID := req.Options.ServerID(); serverID != nil && !serverID.Equal(s.serverIdentifierFor(req)) {
+		s.logger.Info("ignoring request for another server", "mac", req.CHAddr.String(), "server_id", serverID, "our_id", s.serverIdentifierFor(req))
+		return
+	}
 	if s.isBlacklisted(ctx, req.CHAddr.String()) {
 		s.logger.Info("discarded request from blacklisted mac", "mac", req.CHAddr.String())
 		s.sendNAK(req, addr, "mac blacklisted")
@@ -433,13 +450,7 @@ func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAd
 		requestedIP = normalizeIP(requestedIP)
 	}
 	ciaddr := normalizeIP(req.CIAddr)
-	serverID := req.Options.ServerID()
-	s.logger.Debug("received request", "mac", mac, "giaddr", req.GIAddr, "ciaddr", req.CIAddr, "requested_ip", requestedIP, "server_id", serverID, "from", addr)
-	if serverID != nil && !serverID.Equal(s.serverIdentifierFor(req)) {
-		// Not for us, ignore
-		s.logger.Info("ignoring request for another server", "mac", mac, "server_id", serverID, "our_id", s.serverIdentifierFor(req))
-		return
-	}
+	s.logger.Debug("received request", "mac", mac, "giaddr", req.GIAddr, "ciaddr", req.CIAddr, "requested_ip", requestedIP, "from", addr)
 
 	reservation, _ := s.store.GetReservationByMAC(ctx, scope.ID, mac)
 	groupOpts := s.groupOptionsForReservation(ctx, reservation)
@@ -488,6 +499,16 @@ func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAd
 		return
 	}
 
+	// RFC 2131 §4.3.2: when the client explicitly requested an address
+	// (option 50 or ciaddr) and we could not grant it, NAK so the client
+	// restarts configuration instead of running with an address that is
+	// recorded for someone else.
+	if requestedIP != nil && !lease.IPAddr.Equal(requestedIP) {
+		s.logger.Warn("cannot grant requested ip", "mac", mac, "requested_ip", requestedIP, "granted_ip", lease.IPAddr, "scope", scope.Name)
+		s.sendNAK(req, addr, "requested ip unavailable")
+		return
+	}
+
 	// Activate the offered lease. The lease ID is stable because AllocateV4Lease
 	// upserts by (scope_id, mac_addr).
 	if err := s.store.UpdateLeaseState(ctx, lease.ID, models.LeaseActive); err != nil {
@@ -501,7 +522,7 @@ func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAd
 	reply := ReplyFromRequest(req, DHCPACK)
 	reply.YIAddr = lease.IPAddr
 	s.setServerIdentifier(reply, req)
-	s.applyOptions(req, reply, scope, reservation, groupOpts)
+	s.applyOptions(req, reply, scope, reservation, groupOpts, leaseTime)
 	s.sendReply(reply, addr)
 	if isRenewal {
 		s.logger.Info("lease renewed", "mac", mac, "ip", lease.IPAddr, "scope", scope.Name)
@@ -518,12 +539,21 @@ func (s *Server) handleRelease(ctx context.Context, req *Packet) {
 		return
 	}
 	mac := req.CHAddr.String()
-	lease, _ := s.store.GetLeaseByMAC(ctx, scope.ID, mac)
-	if lease != nil {
-		_ = s.store.UpdateLeaseState(ctx, lease.ID, models.LeaseReleased)
+	// RFC 2131 §4.3.4: the released address is in ciaddr. Only that specific
+	// lease may be released — an unrelated packet must not touch others.
+	ip := normalizeIP(req.CIAddr)
+	if ip == nil || ip.Equal(net.IPv4zero) {
+		return
+	}
+	ok, err := s.store.UpdateLeaseStateByMACIP(ctx, scope.ID, mac, ip, models.LeaseReleased)
+	if err != nil {
+		s.logger.Error("release lease", "mac", mac, "ip", ip, "err", err)
+		return
+	}
+	if ok {
 		metrics.LeasesReleased.Inc()
-		s.logger.Info("lease released", "mac", mac, "ip", lease.IPAddr)
-		s.logIPAllocation(ctx, scope, mac, lease.IPAddr, "release", req, lease.Hostname)
+		s.logger.Info("lease released", "mac", mac, "ip", ip)
+		s.logIPAllocation(ctx, scope, mac, ip, "release", req, "")
 	}
 }
 
@@ -533,12 +563,25 @@ func (s *Server) handleDecline(ctx context.Context, req *Packet) {
 		return
 	}
 	mac := req.CHAddr.String()
-	lease, _ := s.store.GetLeaseByMAC(ctx, scope.ID, mac)
-	if lease != nil {
-		_ = s.store.UpdateLeaseState(ctx, lease.ID, models.LeaseDeclined)
+	// RFC 2131 §4.3.3: the declined address is in the requested-IP option.
+	ip := req.Options.RequestedIP()
+	if ip != nil {
+		ip = normalizeIP(ip)
+	} else {
+		ip = normalizeIP(req.CIAddr)
+	}
+	if ip == nil || ip.Equal(net.IPv4zero) {
+		return
+	}
+	ok, err := s.store.UpdateLeaseStateByMACIP(ctx, scope.ID, mac, ip, models.LeaseDeclined)
+	if err != nil {
+		s.logger.Error("decline lease", "mac", mac, "ip", ip, "err", err)
+		return
+	}
+	if ok {
 		metrics.LeasesDeclined.Inc()
-		s.logger.Warn("lease declined", "mac", mac, "ip", lease.IPAddr)
-		s.logIPAllocation(ctx, scope, mac, lease.IPAddr, "decline", req, lease.Hostname)
+		s.logger.Warn("lease declined", "mac", mac, "ip", ip)
+		s.logIPAllocation(ctx, scope, mac, ip, "decline", req, "")
 	}
 }
 
@@ -554,7 +597,7 @@ func (s *Server) handleInform(ctx context.Context, req *Packet, addr *net.UDPAdd
 	reply := ReplyFromRequest(req, DHCPACK)
 	reply.YIAddr = net.IPv4zero
 	s.setServerIdentifier(reply, req)
-	s.applyOptions(req, reply, scope, reservation, groupOpts)
+	s.applyOptions(req, reply, scope, reservation, groupOpts, 0)
 	s.sendReply(reply, addr)
 }
 
@@ -618,10 +661,13 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// NAK must be broadcast; some clients also set the broadcast bit.
+	// NAK must be broadcast; some clients also set the broadcast bit. A zero
+	// yiaddr only forces broadcast when the client has no configured address
+	// either — Inform replies (yiaddr=0, ciaddr set) must be unicast to the
+	// ciaddr (RFC 2131 §4.3.5), which the ciaddr branch below handles.
 	isBroadcast := reply.Options.MessageType() == DHCPNAK ||
 		reply.Flags&0x8000 != 0 ||
-		reply.YIAddr.Equal(net.IPv4zero)
+		(reply.YIAddr.Equal(net.IPv4zero) && ciaddr.Equal(net.IPv4zero))
 
 	if isBroadcast {
 		dest := &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
@@ -784,7 +830,7 @@ func (s *Server) groupOptionsForReservation(ctx context.Context, r *models.Reser
 	return g.Options
 }
 
-func (s *Server) applyOptions(req *Packet, reply *Packet, scope *models.Scope, reservation *models.Reservation, groupOpts json.RawMessage) {
+func (s *Server) applyOptions(req *Packet, reply *Packet, scope *models.Scope, reservation *models.Reservation, groupOpts json.RawMessage, leaseTime int) {
 	scopeOpts := models.ParseOptionMap(scope.Options)
 	groupOptMap := models.ParseOptionMap(groupOpts)
 	resOptMap := models.OptionMap{}
@@ -792,18 +838,15 @@ func (s *Server) applyOptions(req *Packet, reply *Packet, scope *models.Scope, r
 		resOptMap = models.ParseOptionMap(reservation.Options)
 	}
 
-	// Helper to add option
-	addOpt := func(code byte, value interface{}) {
-		raw, err := BuildOption(code, value.(models.OptionValue))
-		if err == nil {
-			reply.Options.Set(code, raw)
-		}
+	// Lease-time options are only meaningful for an Offer/ACK of an actual
+	// lease. They must reflect the lease time really granted (which may be
+	// shorter than the scope default at the client's request), and must not
+	// appear in Inform replies at all (RFC 2131 §4.3.5).
+	if leaseTime > 0 {
+		reply.Options.Set(OptIPAddressLeaseTime, Uint32ToBytes(uint32(leaseTime)))
+		reply.Options.Set(OptRenewalTimeValue, Uint32ToBytes(uint32(leaseTime/2)))
+		reply.Options.Set(OptRebindingTimeValue, Uint32ToBytes(uint32(leaseTime*7/8)))
 	}
-
-	// Common options from scope fields
-	reply.Options.Set(OptIPAddressLeaseTime, Uint32ToBytes(uint32(scope.LeaseTime)))
-	reply.Options.Set(OptRenewalTimeValue, Uint32ToBytes(uint32(scope.LeaseTime/2)))
-	reply.Options.Set(OptRebindingTimeValue, Uint32ToBytes(uint32(scope.LeaseTime*7/8)))
 	if len(scope.Gateway) > 0 {
 		reply.Options.Set(OptRouter, IPsToBytes(scope.Gateway))
 	}
@@ -877,8 +920,6 @@ func (s *Server) applyOptions(req *Packet, reply *Packet, scope *models.Scope, r
 		}
 		reply.Options = filtered
 	}
-
-	_ = addOpt // suppress unused warning if build path changes
 }
 
 func optionMapToValue(v interface{}) models.OptionValue {

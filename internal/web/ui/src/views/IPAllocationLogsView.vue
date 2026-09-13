@@ -37,7 +37,7 @@
       </el-form>
 
       <el-table :data="logs" size="default" stripe empty-text="暂无记录">
-        <el-table-column label="时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="created_at" label="时间" width="180" :formatter="(_, __, val) => formatDate(val)" />
         <el-table-column label="动作" width="90">
           <template #default="{ row }">
             <el-tag size="small" effect="dark" :type="actionType(row.action)">{{ actionLabel(row.action) }}</el-tag>

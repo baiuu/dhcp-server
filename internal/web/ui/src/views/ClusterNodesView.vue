@@ -24,7 +24,7 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="最后心跳" width="180" :formatter="(_, __, val) => formatDate(val)" />
+        <el-table-column prop="last_seen" label="最后心跳" width="180" :formatter="(_, __, val) => formatDate(val)" />
       </el-table>
     </el-card>
   </div>

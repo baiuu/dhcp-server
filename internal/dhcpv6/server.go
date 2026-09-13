@@ -1,8 +1,10 @@
 package dhcpv6
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 	"github.com/dhcp-server/dhcp-server/internal/models"
 	"github.com/dhcp-server/dhcp-server/internal/store"
 	"github.com/google/uuid"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -63,6 +66,16 @@ func (s *Server) logIPAllocation(ctx context.Context, scope *models.Scope, duid,
 	}
 }
 
+// relayHop records one relay layer of an incoming relay-forward chain, from
+// outermost to innermost. It is everything needed to re-encapsulate the
+// relay-reply for that layer.
+type relayHop struct {
+	hopCount byte
+	linkAddr net.IP
+	peerAddr net.IP
+	options  Options // relay options excluding Relay-Message
+}
+
 // relayContext holds information from a DHCPv6 relay-forward message.
 type relayContext struct {
 	hopCount     byte
@@ -71,6 +84,7 @@ type relayContext struct {
 	interfaceID  []byte
 	relayAddr    *net.UDPAddr
 	relayOptions Options // original relay options (excluding Relay-Message)
+	hops         []relayHop
 }
 
 type Server struct {
@@ -101,8 +115,10 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	go s.refreshLoop(ctx)
 
-	// Generate server DUID based on first non-loopback MAC
-	s.serverDUID = s.generateDUID()
+	// Load the persistent server DUID (generated once and stored in the
+	// database) so that it survives restarts and stays identical across
+	// cluster nodes sharing the same database.
+	s.serverDUID = s.loadOrCreateDUID(ctx)
 
 	addr, err := net.ResolveUDPAddr("udp6", s.cfg.Server.V6Listen)
 	if err != nil {
@@ -113,6 +129,11 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("listen udp6: %w", err)
 	}
 	s.conn = conn
+
+	// Join the All_DHCP_Relay_Agents_and_Servers multicast group (ff02::1:2)
+	// so that directly connected clients' Solicits reach us; without this
+	// only relayed traffic is received.
+	s.joinMulticastGroup()
 	s.logger.Info("dhcpv6 server listening", "addr", addr.String())
 
 	s.wg.Add(1)
@@ -129,6 +150,47 @@ func (s *Server) Stop() error {
 	})
 	s.wg.Wait()
 	return nil
+}
+
+// joinMulticastGroup subscribes the socket to ff02::1:2 on the configured
+// interface, or on every multicast-capable interface when none is configured.
+// Failures are logged but not fatal so relay-only deployments keep working.
+func (s *Server) joinMulticastGroup() {
+	pktConn := ipv6.NewPacketConn(s.conn)
+	group := &net.UDPAddr{IP: AllDHCPRelayAgentsAndServers}
+
+	if ifname := s.cfg.Server.Interface; ifname != "" {
+		ifi, err := net.InterfaceByName(ifname)
+		if err != nil {
+			s.logger.Warn("multicast interface not found, relay-only mode", "interface", ifname, "err", err)
+			return
+		}
+		if err := pktConn.JoinGroup(ifi, group); err != nil {
+			s.logger.Warn("join dhcpv6 multicast group failed", "interface", ifname, "err", err)
+		}
+		return
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		s.logger.Warn("list interfaces for multicast join failed", "err", err)
+		return
+	}
+	joined := 0
+	for i := range ifaces {
+		ifi := &ifaces[i]
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagMulticast == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if err := pktConn.JoinGroup(ifi, group); err != nil {
+			s.logger.Debug("join dhcpv6 multicast group skipped", "interface", ifi.Name, "err", err)
+			continue
+		}
+		joined++
+	}
+	if joined == 0 {
+		s.logger.Warn("not joined to any dhcpv6 multicast group; only relayed traffic will be received")
+	}
 }
 
 func (s *Server) reloadScopes(ctx context.Context) error {
@@ -158,8 +220,11 @@ func (s *Server) refreshLoop(ctx context.Context) {
 		case <-s.quit:
 			return
 		case <-ticker.C:
-			if err := s.store.ReleaseExpiredV6Leases(ctx, time.Now().UTC()); err != nil {
+			if err := s.store.ReleaseExpiredV6Leases(ctx); err != nil {
 				s.logger.Error("release expired v6 leases", "err", err)
+			}
+			if err := s.store.ReleaseExpiredV6Prefixes(ctx); err != nil {
+				s.logger.Error("release expired v6 prefixes", "err", err)
 			}
 			if err := s.reloadScopes(ctx); err != nil {
 				s.logger.Error("reload v6 scopes", "err", err)
@@ -217,6 +282,8 @@ func (s *Server) handlePacket(data []byte, addr *net.UDPAddr) {
 		s.handleSolicit(ctx, req, addr, nil)
 	case MsgTypeRequest, MsgTypeRenew, MsgTypeRebind:
 		s.handleRequest(ctx, req, addr, nil)
+	case MsgTypeConfirm:
+		s.handleConfirm(ctx, req, addr, nil)
 	case MsgTypeRelease:
 		s.handleRelease(ctx, req, addr, nil)
 	case MsgTypeDecline:
@@ -251,17 +318,31 @@ func (s *Server) handleRelayForward(data []byte, addr *net.UDPAddr) {
 		relayAddr:    addr,
 		relayOptions: rp.Options.CopyRelayOptions(),
 	}
+	relay.hops = append(relay.hops, relayHop{
+		hopCount: rp.HopCount,
+		linkAddr: rp.LinkAddr,
+		peerAddr: rp.PeerAddr,
+		options:  rp.Options.CopyRelayOptions(),
+	})
 	if ifaceID, ok := rp.Options.InterfaceID(); ok {
 		relay.interfaceID = ifaceID
 	}
 
-	// Handle multi-hop relays: keep unwrapping and use the outermost relay context.
+	// Handle multi-hop relays: keep unwrapping, remember every layer for the
+	// relay-reply encapsulation, and use the innermost relay context for
+	// scope selection.
 	for innerRelay != nil {
 		rp = innerRelay
 		relay.hopCount = rp.HopCount
 		relay.linkAddr = rp.LinkAddr
 		relay.peerAddr = rp.PeerAddr
 		relay.relayOptions = rp.Options.CopyRelayOptions()
+		relay.hops = append(relay.hops, relayHop{
+			hopCount: rp.HopCount,
+			linkAddr: rp.LinkAddr,
+			peerAddr: rp.PeerAddr,
+			options:  rp.Options.CopyRelayOptions(),
+		})
 		if ifaceID, ok := rp.Options.InterfaceID(); ok {
 			relay.interfaceID = ifaceID
 		}
@@ -285,6 +366,8 @@ func (s *Server) handleRelayForward(data []byte, addr *net.UDPAddr) {
 		s.handleSolicit(ctx, innerPacket, addr, relay)
 	case MsgTypeRequest, MsgTypeRenew, MsgTypeRebind:
 		s.handleRequest(ctx, innerPacket, addr, relay)
+	case MsgTypeConfirm:
+		s.handleConfirm(ctx, innerPacket, addr, relay)
 	case MsgTypeRelease:
 		s.handleRelease(ctx, innerPacket, addr, relay)
 	case MsgTypeDecline:
@@ -296,7 +379,24 @@ func (s *Server) handleRelayForward(data []byte, addr *net.UDPAddr) {
 	}
 }
 
+// serverIDMatches reports whether the message may be processed by this
+// server per RFC 8415: when the client includes a Server ID option it must
+// equal our DUID, otherwise the message must be discarded.
+func (s *Server) serverIDMatches(req *Packet) bool {
+	opt, ok := req.Options.Get(OptServerID)
+	if !ok {
+		return true
+	}
+	return bytes.Equal(opt.Data, s.serverDUID)
+}
+
 func (s *Server) handleSolicit(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	// A message carrying both IA_NA and IA_PD (typical for CPE routers) must
+	// get answers for every IA in a single Reply (RFC 8415 §18.3.1).
+	if hasIANAOpt(req) && s.hasPD(req) {
+		s.handleSolicitCombined(ctx, req, addr, relay)
+		return
+	}
 	if s.hasPD(req) {
 		s.handleSolicitPD(ctx, req, addr, relay)
 		return
@@ -356,7 +456,10 @@ func (s *Server) handleSolicit(ctx context.Context, req *Packet, addr *net.UDPAd
 
 	// Rapid Commit: client wants immediate assignment (common on Android).
 	if _, ok := req.Options.Get(OptRapidCommit); ok {
-		_ = s.store.UpdateV6LeaseState(ctx, lease.ID, models.LeaseActive)
+		if err := s.store.UpdateV6LeaseState(ctx, lease.ID, models.LeaseActive); err != nil {
+			s.logger.Error("activate v6 lease failed", "duid", duidStr, "ip", lease.IPAddr, "err", err)
+			return
+		}
 		reply.MessageType = MsgTypeReply
 		reply.Options.Add(OptRapidCommit, []byte{})
 		s.logger.Info("v6 rapid commit", "duid", duidStr, "ip", lease.IPAddr, "scope", scope.Name)
@@ -375,6 +478,16 @@ func (s *Server) handleSolicit(ctx context.Context, req *Packet, addr *net.UDPAd
 }
 
 func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	// Rebind is addressed to any available server and carries no Server ID;
+	// Request and Renew must be validated (RFC 8415 §16.4/§16.6).
+	if req.MessageType != MsgTypeRebind && !s.serverIDMatches(req) {
+		s.logger.Debug("ignoring v6 request for another server", "type", req.MessageType)
+		return
+	}
+	if hasIANAOpt(req) && s.hasPD(req) {
+		s.handleRequestCombined(ctx, req, addr, relay)
+		return
+	}
 	if s.hasPD(req) {
 		s.handleRequestPD(ctx, req, addr, relay)
 		return
@@ -416,7 +529,11 @@ func (s *Server) handleRequest(ctx context.Context, req *Packet, addr *net.UDPAd
 		return
 	}
 
-	_ = s.store.UpdateV6LeaseState(ctx, lease.ID, models.LeaseActive)
+	if err := s.store.UpdateV6LeaseState(ctx, lease.ID, models.LeaseActive); err != nil {
+		s.logger.Error("activate v6 lease failed", "duid", duidStr, "ip", lease.IPAddr, "err", err)
+		s.sendReplyWithStatus(req, addr, relay, 2, "address unavailable")
+		return
+	}
 
 	reply := ReplyFromRequest(req, MsgTypeReply)
 	reply.Options.Add(OptServerID, s.serverDUID)
@@ -459,6 +576,15 @@ func (s *Server) extractRequestedIP(req *Packet, iaid uint32) net.IP {
 
 func (s *Server) hasPD(req *Packet) bool {
 	_, ok := req.Options.Get(OptIAPD)
+	return ok
+}
+
+// hasIANA reports whether the message carries an IA_NA or IA_TA option.
+func hasIANAOpt(req *Packet) bool {
+	if _, ok := req.Options.Get(OptIANA); ok {
+		return true
+	}
+	_, ok := req.Options.Get(OptIATA)
 	return ok
 }
 
@@ -547,7 +673,11 @@ func (s *Server) handleRequestPD(ctx context.Context, req *Packet, addr *net.UDP
 		return
 	}
 
-	_ = s.store.UpdateV6PrefixState(ctx, p.ID, models.LeaseActive)
+	if err := s.store.UpdateV6PrefixState(ctx, p.ID, models.LeaseActive); err != nil {
+		s.logger.Error("activate v6 prefix failed", "duid", duidStr, "prefix", p.Prefix.String(), "err", err)
+		s.sendReplyWithStatus(req, addr, relay, 6, "no prefixes")
+		return
+	}
 
 	reply := ReplyFromRequest(req, MsgTypeReply)
 	reply.Options.Add(OptServerID, s.serverDUID)
@@ -557,6 +687,203 @@ func (s *Server) handleRequestPD(ctx context.Context, req *Packet, addr *net.UDP
 	s.sendReply(reply, addr, relay)
 	s.logger.Info("v6 prefix delegated", "duid", duidStr, "prefix", p.Prefix.String(), "scope", scope.Name)
 	s.logIPAllocation(ctx, scope, duidStr, iaidStr, nil, p.Prefix, "ack", relay, "")
+}
+
+// handleSolicitCombined answers a Solicit that carries both IA_NA and IA_PD
+// in a single Advertise/Reply (RFC 8415 §18.3.1).
+func (s *Server) handleSolicitCombined(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	scope, clientID, iaid, err := s.parseCommon(req, relay)
+	if err != nil {
+		s.logger.Warn("solicit combined parse", "err", err)
+		return
+	}
+	if scope != nil && !scope.Enabled {
+		scope = nil
+	}
+	pdScope, _, pdIAID, pdErr := s.parseCommonPD(req, relay)
+	if pdErr != nil || pdScope == nil || !pdScope.Enabled || pdScope.Prefix == nil {
+		pdScope = nil
+	}
+	if scope == nil && pdScope == nil {
+		return
+	}
+
+	duidStr := ParseDUID(clientID)
+	iaidStr := fmt.Sprintf("%d", iaid)
+	pdIAIDStr := fmt.Sprintf("%d", pdIAID)
+
+	var lease *models.V6Lease
+	if scope != nil {
+		leaseTime := normalizedV6LeaseTimes(scope)
+		l, err := s.store.AllocateV6Lease(ctx, scope, duidStr, iaidStr, "", nil, leaseTime, scopeMaxLeaseTime(scope))
+		if err != nil {
+			s.logger.Warn("allocate v6 lease failed", "duid", duidStr, "scope", scope.Name, "err", err)
+		} else {
+			lease = l
+		}
+	}
+
+	var prefix *models.V6Prefix
+	if pdScope != nil {
+		p, err := s.store.AllocateV6Prefix(ctx, pdScope, duidStr, pdIAIDStr, normalizedV6LeaseTimes(pdScope), scopeMaxLeaseTime(pdScope))
+		if err != nil {
+			s.logger.Warn("allocate v6 prefix failed", "duid", duidStr, "scope", pdScope.Name, "err", err)
+		} else {
+			prefix = p
+		}
+	}
+
+	if lease == nil && prefix == nil {
+		return
+	}
+
+	reply := ReplyFromRequest(req, MsgTypeAdvertise)
+	reply.Options.Add(OptServerID, s.serverDUID)
+	reply.Options.Add(OptClientID, clientID)
+
+	rapidCommit := false
+	if _, ok := req.Options.Get(OptRapidCommit); ok {
+		if lease != nil {
+			if err := s.store.UpdateV6LeaseState(ctx, lease.ID, models.LeaseActive); err != nil {
+				s.logger.Error("activate v6 lease failed", "duid", duidStr, "ip", lease.IPAddr, "err", err)
+				lease = nil
+			}
+		}
+		if prefix != nil {
+			if err := s.store.UpdateV6PrefixState(ctx, prefix.ID, models.LeaseActive); err != nil {
+				s.logger.Error("activate v6 prefix failed", "duid", duidStr, "prefix", prefix.Prefix.String(), "err", err)
+				prefix = nil
+			}
+		}
+		if lease == nil && prefix == nil {
+			return
+		}
+		rapidCommit = true
+		reply.MessageType = MsgTypeReply
+		reply.Options.Add(OptRapidCommit, []byte{})
+	}
+
+	if lease != nil {
+		s.applyIA(reply, iaid, lease.IPAddr, scope)
+	}
+	if prefix != nil {
+		s.applyPD(reply, pdIAID, prefix.Prefix, normalizedV6LeaseTimes(pdScope))
+	}
+	optScope := scope
+	if optScope == nil {
+		optScope = pdScope
+	}
+	s.applyOptions(req, reply, optScope, nil, nil)
+	s.sendReply(reply, addr, relay)
+
+	action := "offer"
+	if rapidCommit {
+		action = "ack"
+	}
+	if lease != nil {
+		s.logger.Info("v6 lease advertised (combined)", "duid", duidStr, "ip", lease.IPAddr, "scope", scope.Name)
+		s.logIPAllocation(ctx, scope, duidStr, iaidStr, lease.IPAddr, nil, action, relay, "")
+	}
+	if prefix != nil {
+		s.logger.Info("v6 prefix advertised (combined)", "duid", duidStr, "prefix", prefix.Prefix.String(), "scope", pdScope.Name)
+		s.logIPAllocation(ctx, pdScope, duidStr, pdIAIDStr, nil, prefix.Prefix, action, relay, "")
+	}
+}
+
+// handleRequestCombined answers a Request/Renew/Rebind that carries both
+// IA_NA and IA_PD in a single Reply (RFC 8415 §18.3.2).
+func (s *Server) handleRequestCombined(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	scope, clientID, iaid, err := s.parseCommon(req, relay)
+	if err != nil {
+		s.logger.Warn("request combined parse", "err", err)
+		return
+	}
+	if scope != nil && !scope.Enabled {
+		scope = nil
+	}
+	pdScope, _, pdIAID, pdErr := s.parseCommonPD(req, relay)
+	if pdErr != nil || pdScope == nil || !pdScope.Enabled || pdScope.Prefix == nil {
+		pdScope = nil
+	}
+	if scope == nil && pdScope == nil {
+		s.sendReplyWithStatus(req, addr, relay, 2, "no scope")
+		return
+	}
+
+	duidStr := ParseDUID(clientID)
+	iaidStr := fmt.Sprintf("%d", iaid)
+	pdIAIDStr := fmt.Sprintf("%d", pdIAID)
+
+	var lease *models.V6Lease
+	if scope != nil {
+		requestedIP := s.extractRequestedIP(req, iaid)
+		reservation, _ := s.store.GetV6ReservationByDUID(ctx, scope.ID, duidStr)
+		l, err := s.store.AllocateV6Lease(ctx, scope, duidStr, iaidStr, "", requestedIP, normalizedV6LeaseTimes(scope), scopeMaxLeaseTime(scope))
+		if err != nil {
+			s.logger.Warn("confirm v6 lease failed", "duid", duidStr, "requested_ip", requestedIP, "scope", scope.Name, "err", err)
+		} else if err := s.store.UpdateV6LeaseState(ctx, l.ID, models.LeaseActive); err != nil {
+			s.logger.Error("activate v6 lease failed", "duid", duidStr, "ip", l.IPAddr, "err", err)
+		} else {
+			lease = l
+		}
+		_ = reservation
+	}
+
+	var prefix *models.V6Prefix
+	if pdScope != nil {
+		p, err := s.store.AllocateV6Prefix(ctx, pdScope, duidStr, pdIAIDStr, normalizedV6LeaseTimes(pdScope), scopeMaxLeaseTime(pdScope))
+		if err != nil {
+			s.logger.Warn("confirm v6 prefix failed", "duid", duidStr, "scope", pdScope.Name, "err", err)
+		} else if err := s.store.UpdateV6PrefixState(ctx, p.ID, models.LeaseActive); err != nil {
+			s.logger.Error("activate v6 prefix failed", "duid", duidStr, "prefix", p.Prefix.String(), "err", err)
+		} else {
+			prefix = p
+		}
+	}
+
+	if lease == nil && prefix == nil {
+		s.sendReplyWithStatus(req, addr, relay, 2, "address unavailable")
+		return
+	}
+
+	reply := ReplyFromRequest(req, MsgTypeReply)
+	reply.Options.Add(OptServerID, s.serverDUID)
+	reply.Options.Add(OptClientID, clientID)
+	if lease != nil {
+		s.applyIA(reply, iaid, lease.IPAddr, scope)
+	}
+	if prefix != nil {
+		s.applyPD(reply, pdIAID, prefix.Prefix, normalizedV6LeaseTimes(pdScope))
+	}
+	optScope := scope
+	if optScope == nil {
+		optScope = pdScope
+	}
+	s.applyOptions(req, reply, optScope, nil, nil)
+	s.sendReply(reply, addr, relay)
+
+	if lease != nil {
+		s.logger.Info("v6 lease ack (combined)", "duid", duidStr, "ip", lease.IPAddr, "scope", scope.Name)
+		s.logIPAllocation(ctx, scope, duidStr, iaidStr, lease.IPAddr, nil, "ack", relay, "")
+	}
+	if prefix != nil {
+		s.logger.Info("v6 prefix delegated (combined)", "duid", duidStr, "prefix", prefix.Prefix.String(), "scope", pdScope.Name)
+		s.logIPAllocation(ctx, pdScope, duidStr, pdIAIDStr, nil, prefix.Prefix, "ack", relay, "")
+	}
+}
+
+func normalizedV6LeaseTimes(scope *models.Scope) int {
+	if scope.LeaseTime == 0 {
+		return DefaultV6LeaseTime
+	}
+	return scope.LeaseTime
+}
+
+func scopeMaxLeaseTime(scope *models.Scope) int {
+	if scope.MaxLeaseTime == 0 {
+		return DefaultV6MaxLeaseTime
+	}
+	return scope.MaxLeaseTime
 }
 
 func (s *Server) parseCommonPD(req *Packet, relay *relayContext) (*models.Scope, []byte, uint32, error) {
@@ -591,13 +918,41 @@ func (s *Server) applyPD(reply *Packet, iaid uint32, prefix *net.IPNet, leaseTim
 }
 
 func (s *Server) handleRelease(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
-	if s.hasPD(req) {
-		s.handleReleasePD(ctx, req, addr, relay)
+	if !s.serverIDMatches(req) {
+		s.logger.Debug("ignoring v6 release for another server")
 		return
 	}
+	// A Release may carry both IA_NA and IA_PD; process every IA and answer
+	// with a single Reply (RFC 8415 §18.3.7).
+	var clientID []byte
+	if hasIANAOpt(req) {
+		clientID = s.releaseV6Lease(ctx, req, relay)
+	}
+	if s.hasPD(req) {
+		if id := s.releaseV6Prefix(ctx, req, relay); clientID == nil {
+			clientID = id
+		}
+	}
+	if clientID == nil {
+		if opt, ok := req.Options.Get(OptClientID); ok {
+			clientID = opt.Data
+		} else {
+			return
+		}
+	}
+	reply := ReplyFromRequest(req, MsgTypeReply)
+	reply.Options.Add(OptServerID, s.serverDUID)
+	reply.Options.Add(OptClientID, clientID)
+	reply.Options.Add(OptStatusCode, BuildStatusCode(0, "release received"))
+	s.sendReply(reply, addr, relay)
+}
+
+// releaseV6Lease releases the IA_NA binding carried by the message, if any.
+// It returns the client ID when the message parsed successfully.
+func (s *Server) releaseV6Lease(ctx context.Context, req *Packet, relay *relayContext) []byte {
 	scope, clientID, iaid, err := s.parseCommon(req, relay)
-	if err != nil {
-		return
+	if err != nil || scope == nil {
+		return nil
 	}
 	duidStr := ParseDUID(clientID)
 	lease, _ := s.store.GetV6LeaseByDUID(ctx, scope.ID, duidStr, fmt.Sprintf("%d", iaid))
@@ -607,17 +962,14 @@ func (s *Server) handleRelease(ctx context.Context, req *Packet, addr *net.UDPAd
 		s.logger.Info("v6 lease released", "duid", duidStr, "ip", lease.IPAddr)
 		s.logIPAllocation(ctx, scope, duidStr, fmt.Sprintf("%d", iaid), lease.IPAddr, nil, "release", relay, "")
 	}
-	reply := ReplyFromRequest(req, MsgTypeReply)
-	reply.Options.Add(OptServerID, s.serverDUID)
-	reply.Options.Add(OptClientID, clientID)
-	reply.Options.Add(OptStatusCode, BuildStatusCode(0, "release received"))
-	s.sendReply(reply, addr, relay)
+	return clientID
 }
 
-func (s *Server) handleReleasePD(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+// releaseV6Prefix releases the IA_PD binding carried by the message, if any.
+func (s *Server) releaseV6Prefix(ctx context.Context, req *Packet, relay *relayContext) []byte {
 	scope, clientID, iaid, err := s.parseCommonPD(req, relay)
-	if err != nil {
-		return
+	if err != nil || scope == nil {
+		return nil
 	}
 	duidStr := ParseDUID(clientID)
 	iaidStr := fmt.Sprintf("%d", iaid)
@@ -628,14 +980,71 @@ func (s *Server) handleReleasePD(ctx context.Context, req *Packet, addr *net.UDP
 		s.logger.Info("v6 prefix released", "duid", duidStr, "prefix", p.Prefix.String())
 		s.logIPAllocation(ctx, scope, duidStr, iaidStr, nil, p.Prefix, "release", relay, "")
 	}
+	return clientID
+}
+
+// handleConfirm implements RFC 8415 §18.3.3: the client asks whether its
+// addresses are still appropriate for the link; we answer Success when every
+// address in the message belongs to the matched scope, NotOnLink otherwise.
+func (s *Server) handleConfirm(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	scope, clientID, _, err := s.parseCommon(req, relay)
+	if err != nil {
+		return
+	}
+	status := uint16(0) // Success
+	msg := "addresses are on-link"
+	if scope == nil || scope.Subnet == nil {
+		status = 4 // NotOnLink
+		msg = "no matching link"
+	} else {
+		for _, ip := range extractIAAddrs(req) {
+			if !scope.Subnet.Contains(ip) {
+				status = 4
+				msg = "address not on-link"
+				break
+			}
+		}
+	}
 	reply := ReplyFromRequest(req, MsgTypeReply)
 	reply.Options.Add(OptServerID, s.serverDUID)
 	reply.Options.Add(OptClientID, clientID)
-	reply.Options.Add(OptStatusCode, BuildStatusCode(0, "release received"))
+	reply.Options.Add(OptStatusCode, BuildStatusCode(status, msg))
 	s.sendReply(reply, addr, relay)
 }
 
+// extractIAAddrs returns every IA Address carried by the IA_NA/IA_TA options
+// of the message (Confirm may carry several).
+func extractIAAddrs(req *Packet) []net.IP {
+	var out []net.IP
+	for _, opt := range req.Options {
+		if opt.Code != OptIANA && opt.Code != OptIATA {
+			continue
+		}
+		data := opt.Data
+		if len(data) < 12 {
+			continue
+		}
+		data = data[12:] // skip iaid/t1/t2 header
+		for len(data) >= 4 {
+			code := binary.BigEndian.Uint16(data[0:2])
+			length := int(binary.BigEndian.Uint16(data[2:4]))
+			if len(data) < 4+length {
+				break
+			}
+			if code == OptIAAddr && length >= 16 {
+				out = append(out, net.IP(append([]byte(nil), data[4:20]...)))
+			}
+			data = data[4+length:]
+		}
+	}
+	return out
+}
+
 func (s *Server) handleDecline(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	if !s.serverIDMatches(req) {
+		s.logger.Debug("ignoring v6 decline for another server")
+		return
+	}
 	scope, clientID, iaid, err := s.parseCommon(req, relay)
 	if err != nil {
 		return
@@ -648,9 +1057,19 @@ func (s *Server) handleDecline(ctx context.Context, req *Packet, addr *net.UDPAd
 		s.logger.Warn("v6 lease declined", "duid", duidStr, "ip", lease.IPAddr)
 		s.logIPAllocation(ctx, scope, duidStr, fmt.Sprintf("%d", iaid), lease.IPAddr, nil, "decline", relay, "")
 	}
+	// RFC 8415 §18.3.8: a Decline is always answered with a Reply.
+	reply := ReplyFromRequest(req, MsgTypeReply)
+	reply.Options.Add(OptServerID, s.serverDUID)
+	reply.Options.Add(OptClientID, clientID)
+	reply.Options.Add(OptStatusCode, BuildStatusCode(0, "decline received"))
+	s.sendReply(reply, addr, relay)
 }
 
 func (s *Server) handleInformationRequest(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
+	if !s.serverIDMatches(req) {
+		s.logger.Debug("ignoring v6 information-request for another server")
+		return
+	}
 	scope, clientID, _, err := s.parseCommon(req, relay)
 	if err != nil || scope == nil {
 		return
@@ -841,19 +1260,33 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr, relay *relayContext
 
 	dest := &net.UDPAddr{IP: addr.IP, Port: 546, Zone: addr.Zone}
 	if relay != nil {
-		// Relayed reply: wrap in a relay-reply message and send back to the relay agent.
-		rp := &RelayPacket{
-			MessageType: MsgTypeRelayRepl,
-			HopCount:    relay.hopCount,
-			LinkAddr:    relay.linkAddr,
-			PeerAddr:    relay.peerAddr,
-			Options:     relay.relayOptions.CopyRelayOptions(),
+		// Relayed reply: re-encapsulate mirroring the incoming relay chain
+		// (innermost layer first), so each relay on the path can strip its
+		// own layer (RFC 8415 §19.3).
+		hops := relay.hops
+		if len(hops) == 0 {
+			hops = []relayHop{{
+				hopCount: relay.hopCount,
+				linkAddr: relay.linkAddr,
+				peerAddr: relay.peerAddr,
+				options:  relay.relayOptions,
+			}}
 		}
-		rp.Options.Add(OptRelayMsg, data)
-		data, err = rp.Marshal()
-		if err != nil {
-			s.logger.Error("marshal v6 relay reply", "err", err)
-			return
+		for i := len(hops) - 1; i >= 0; i-- {
+			h := hops[i]
+			rp := &RelayPacket{
+				MessageType: MsgTypeRelayRepl,
+				HopCount:    h.hopCount,
+				LinkAddr:    h.linkAddr,
+				PeerAddr:    h.peerAddr,
+				Options:     h.options,
+			}
+			rp.Options.Add(OptRelayMsg, data)
+			data, err = rp.Marshal()
+			if err != nil {
+				s.logger.Error("marshal v6 relay reply", "err", err)
+				return
+			}
 		}
 		dest = &net.UDPAddr{IP: relay.relayAddr.IP, Port: 547, Zone: relay.relayAddr.Zone}
 	}
@@ -875,6 +1308,22 @@ func (s *Server) generateDUID() []byte {
 		}
 	}
 	return DUIDLL(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})
+}
+
+// loadOrCreateDUID returns the stable server DUID, generating and persisting
+// it on first use. A stable DUID is required for Server-ID validation:
+// clients remember it across Solicit/Request and Renew/Release exchanges.
+func (s *Server) loadOrCreateDUID(ctx context.Context) []byte {
+	if v, err := s.store.GetServerState(ctx, "server_duid"); err == nil && v != "" {
+		if raw, err := hex.DecodeString(v); err == nil && len(raw) >= 4 {
+			return raw
+		}
+	}
+	duid := s.generateDUID()
+	if err := s.store.SetServerState(ctx, "server_duid", hex.EncodeToString(duid)); err != nil {
+		s.logger.Warn("persist server duid failed", "err", err)
+	}
+	return duid
 }
 
 func ipInRange(ip, start, end net.IP) bool {

@@ -1124,7 +1124,11 @@ func (a *API) handleDeleteMACBlacklist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleListClusterNodes(w http.ResponseWriter, r *http.Request) {
-	nodes, err := a.store.ListHANodesByCluster(r.Context(), a.cfg.Cluster.ClusterID)
+	offlineAfter := int(a.cfg.Cluster.NodeTimeout.Seconds())
+	if offlineAfter <= 0 {
+		offlineAfter = 30
+	}
+	nodes, err := a.store.ListHANodesByCluster(r.Context(), a.cfg.Cluster.ClusterID, offlineAfter)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
