@@ -16,8 +16,11 @@
       <el-form-item label="子网 (CIDR)" prop="subnet">
         <el-input v-model="form.subnet" :placeholder="form.v6 ? '2001:db8::/64' : '192.168.1.0/24'" />
       </el-form-item>
-      <el-form-item v-if="form.v6" label="前缀 (PD)">
-        <el-input v-model="form.prefix" placeholder="2001:db8:ff00::/56" />
+      <el-form-item v-if="form.v6" label="启用 PD">
+        <el-switch v-model="form.pd_enabled" active-text="开启前缀委派" />
+      </el-form-item>
+      <el-form-item v-if="form.v6 && form.pd_enabled" label="前缀池 (PD)" prop="prefix">
+        <el-input v-model="form.prefix" placeholder="2001:db8::/48（必须大于 /64，如 /48、/44）" />
       </el-form-item>
       <el-row :gutter="20">
         <el-col :span="12">
@@ -97,6 +100,7 @@ const defaultForm = {
   name: '',
   v6: false,
   subnet: '',
+  pd_enabled: false,
   prefix: '',
   start_ip: '',
   end_ip: '',
@@ -113,6 +117,16 @@ const rules = {
   subnet: [{ required: true, message: '请输入子网', trigger: 'blur' }],
   start_ip: [{ required: true, message: '请输入起始 IP', trigger: 'blur' }],
   end_ip: [{ required: true, message: '请输入结束 IP', trigger: 'blur' }],
+  prefix: [{
+    validator: (rule, value, cb) => {
+      if (form.value.v6 && form.value.pd_enabled && !value) {
+        cb(new Error('启用 PD 时必须填写前缀池（必须大于 /64）'))
+      } else {
+        cb()
+      }
+    },
+    trigger: 'blur'
+  }],
 }
 
 watch(() => props.scope, (s) => {

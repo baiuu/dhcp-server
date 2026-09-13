@@ -270,6 +270,7 @@ func (a *API) handleCreateScope(w http.ResponseWriter, r *http.Request) {
 		LeaseTime    int                    `json:"lease_time"`
 		MaxLeaseTime int                    `json:"max_lease_time"`
 		Enabled      bool                   `json:"enabled"`
+		PDEnabled    bool                   `json:"pd_enabled"`
 		Options      map[string]interface{} `json:"options"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -313,6 +314,7 @@ func (a *API) handleUpdateScope(w http.ResponseWriter, r *http.Request) {
 		LeaseTime    int                    `json:"lease_time"`
 		MaxLeaseTime int                    `json:"max_lease_time"`
 		Enabled      bool                   `json:"enabled"`
+		PDEnabled    bool                   `json:"pd_enabled"`
 		Options      map[string]interface{} `json:"options"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -359,6 +361,7 @@ func scopeFromRequest(req *struct {
 	LeaseTime    int                    `json:"lease_time"`
 	MaxLeaseTime int                    `json:"max_lease_time"`
 	Enabled      bool                   `json:"enabled"`
+	PDEnabled    bool                   `json:"pd_enabled"`
 	Options      map[string]interface{} `json:"options"`
 }) (*models.Scope, error) {
 	_, ipnet, err := net.ParseCIDR(req.Subnet)
@@ -425,6 +428,7 @@ func scopeFromRequest(req *struct {
 		LeaseTime:    req.LeaseTime,
 		MaxLeaseTime: req.MaxLeaseTime,
 		Enabled:      req.Enabled,
+		PDEnabled:    req.PDEnabled,
 		Options:      opts,
 	}, nil
 }

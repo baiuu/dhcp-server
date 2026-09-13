@@ -32,9 +32,12 @@ type Scope struct {
 	LeaseTime    int             `json:"lease_time"`
 	MaxLeaseTime int             `json:"max_lease_time"`
 	Enabled      bool            `json:"enabled"`
-	Options      json.RawMessage `json:"options"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	// PDEnabled 开启后该作用域才处理 IA_PD（前缀委派）请求，
+	// 且必须同时配置 Prefix 作为委派池。
+	PDEnabled bool            `json:"pd_enabled"`
+	Options   json.RawMessage `json:"options"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 func (s *Scope) Normalize() {

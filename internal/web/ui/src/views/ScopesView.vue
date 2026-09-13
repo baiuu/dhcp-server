@@ -22,6 +22,12 @@
         <el-table-column label="子网/前缀" min-width="160" show-overflow-tooltip>
           <template #default="{ row }">{{ row.v6 ? (row.prefix || row.subnet) : row.subnet }}</template>
         </el-table-column>
+        <el-table-column label="PD" width="70">
+          <template #default="{ row }">
+            <el-tag v-if="row.v6" :type="row.pd_enabled ? 'success' : 'info'" size="small" effect="dark">{{ row.pd_enabled ? '开启' : '关闭' }}</el-tag>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="范围" min-width="180" show-overflow-tooltip>
           <template #default="{ row }">{{ row.start_ip }} - {{ row.end_ip }}</template>
         </el-table-column>

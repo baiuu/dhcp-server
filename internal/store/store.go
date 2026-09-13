@@ -404,7 +404,7 @@ func (s *Store) CreateScope(ctx context.Context, scope *models.Scope) error {
 		prefix = scope.Prefix
 	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO scopes (id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, options, created_at, updated_at)
+		INSERT INTO scopes (id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, pd_enabled, options, created_at, updated_at)
 		VALUES ($1, $2, $3,
 			regexp_replace(text($4), '^::ffff:', '')::cidr,
 			regexp_replace(text($5), '^::ffff:', '')::cidr,
@@ -412,18 +412,18 @@ func (s *Store) CreateScope(ctx context.Context, scope *models.Scope) error {
 			ARRAY(SELECT regexp_replace(host(x), '^::ffff:', '')::inet FROM unnest($8::inet[]) x),
 			ARRAY(SELECT regexp_replace(host(x), '^::ffff:', '')::inet FROM unnest($9::inet[]) x),
 			ARRAY(SELECT regexp_replace(host(x), '^::ffff:', '')::inet FROM unnest($10::inet[]) x),
-			$11, $12, $13, $14, $15, $16, $17)
+			$11, $12, $13, $14, $15, $16, $17, $18)
 	`, scope.ID, scope.Name, scope.V6, scope.Subnet, prefix,
 		scope.StartIP, scope.EndIP,
 		pgtype.FlatArray[net.IP](scope.Gateway), pgtype.FlatArray[net.IP](scope.DNS), pgtype.FlatArray[net.IP](scope.ExcludedIPs),
-		scope.DomainName, scope.LeaseTime, scope.MaxLeaseTime, scope.Enabled, scope.Options,
+		scope.DomainName, scope.LeaseTime, scope.MaxLeaseTime, scope.Enabled, scope.PDEnabled, scope.Options,
 		scope.CreatedAt, scope.UpdatedAt)
 	return err
 }
 
 func (s *Store) GetScopeByID(ctx context.Context, id string) (*models.Scope, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, options, created_at, updated_at
+		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, pd_enabled, options, created_at, updated_at
 		FROM scopes WHERE id = $1
 	`, id)
 	return scanScope(row)
@@ -431,7 +431,7 @@ func (s *Store) GetScopeByID(ctx context.Context, id string) (*models.Scope, err
 
 func (s *Store) GetScopeByName(ctx context.Context, name string) (*models.Scope, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, options, created_at, updated_at
+		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, pd_enabled, options, created_at, updated_at
 		FROM scopes WHERE name = $1
 	`, name)
 	return scanScope(row)
@@ -439,7 +439,7 @@ func (s *Store) GetScopeByName(ctx context.Context, name string) (*models.Scope,
 
 func (s *Store) ListScopes(ctx context.Context) ([]*models.Scope, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, options, created_at, updated_at
+		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, pd_enabled, options, created_at, updated_at
 		FROM scopes ORDER BY name
 	`)
 	if err != nil {
@@ -471,12 +471,12 @@ func (s *Store) UpdateScope(ctx context.Context, scope *models.Scope) error {
 			dns=ARRAY(SELECT regexp_replace(host(x), '^::ffff:', '')::inet FROM unnest($9::inet[]) x),
 			excluded_ips=ARRAY(SELECT regexp_replace(host(x), '^::ffff:', '')::inet FROM unnest($10::inet[]) x),
 			domain_name=$11,
-			lease_time=$12, max_lease_time=$13, enabled=$14, options=$15, updated_at=$16
+			lease_time=$12, max_lease_time=$13, enabled=$14, pd_enabled=$15, options=$16, updated_at=$17
 		WHERE id=$1
 	`, scope.ID, scope.Name, scope.V6, scope.Subnet, prefix,
 		scope.StartIP, scope.EndIP,
 		pgtype.FlatArray[net.IP](scope.Gateway), pgtype.FlatArray[net.IP](scope.DNS), pgtype.FlatArray[net.IP](scope.ExcludedIPs),
-		scope.DomainName, scope.LeaseTime, scope.MaxLeaseTime, scope.Enabled, scope.Options,
+		scope.DomainName, scope.LeaseTime, scope.MaxLeaseTime, scope.Enabled, scope.PDEnabled, scope.Options,
 		scope.UpdatedAt)
 	return err
 }
@@ -503,7 +503,7 @@ func (s *Store) ListScopesPaged(ctx context.Context, v6 *bool, offset, limit int
 	paramOffset := len(args)
 	limitSQL := fmt.Sprintf(" LIMIT $%d OFFSET $%d", paramOffset+1, paramOffset+2)
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, options, created_at, updated_at
+		SELECT id, name, v6, subnet, prefix, start_ip, end_ip, gateway, dns, excluded_ips, domain_name, lease_time, max_lease_time, enabled, pd_enabled, options, created_at, updated_at
 		FROM scopes`+where+` ORDER BY name`+limitSQL,
 		queryArgs...)
 	if err != nil {
@@ -528,7 +528,7 @@ func scanScope(row pgx.Row) (*models.Scope, error) {
 	var startIP, endIP net.IP
 	var gw, dns, excluded []net.IP
 	err := row.Scan(&sc.ID, &sc.Name, &sc.V6, &cidr, &prefix, &startIP, &endIP, &gw, &dns, &excluded, &sc.DomainName,
-		&sc.LeaseTime, &sc.MaxLeaseTime, &sc.Enabled, &sc.Options, &sc.CreatedAt, &sc.UpdatedAt)
+		&sc.LeaseTime, &sc.MaxLeaseTime, &sc.Enabled, &sc.PDEnabled, &sc.Options, &sc.CreatedAt, &sc.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

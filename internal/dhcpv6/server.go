@@ -602,7 +602,7 @@ func (s *Server) handleSolicitPD(ctx context.Context, req *Packet, addr *net.UDP
 		s.logger.Warn("solicit pd parse", "err", err)
 		return
 	}
-	if scope == nil || !scope.Enabled || scope.Prefix == nil {
+	if scope == nil || !scope.Enabled || !scope.PDEnabled || scope.Prefix == nil {
 		// No PD pool for this client: answer with NoPrefixAvail so the client
 		// stops retransmitting instead of retrying forever.
 		reply := ReplyFromRequest(req, MsgTypeAdvertise)
@@ -674,7 +674,7 @@ func (s *Server) handleRequestPD(ctx context.Context, req *Packet, addr *net.UDP
 		s.logger.Warn("request pd parse", "err", err)
 		return
 	}
-	if scope == nil || !scope.Enabled || scope.Prefix == nil {
+	if scope == nil || !scope.Enabled || !scope.PDEnabled || scope.Prefix == nil {
 		s.sendReplyWithStatus(req, addr, relay, 6, "no prefixes") // NoPrefixAvail
 		return
 	}
@@ -726,7 +726,7 @@ func (s *Server) handleSolicitCombined(ctx context.Context, req *Packet, addr *n
 		scope = nil
 	}
 	pdScope, _, pdIAID, pdErr := s.parseCommonPD(req, relay)
-	if pdErr != nil || pdScope == nil || !pdScope.Enabled || pdScope.Prefix == nil {
+	if pdErr != nil || pdScope == nil || !pdScope.Enabled || !pdScope.PDEnabled || pdScope.Prefix == nil {
 		pdScope = nil
 	}
 	if scope == nil && pdScope == nil {
@@ -828,7 +828,7 @@ func (s *Server) handleRequestCombined(ctx context.Context, req *Packet, addr *n
 		scope = nil
 	}
 	pdScope, _, pdIAID, pdErr := s.parseCommonPD(req, relay)
-	if pdErr != nil || pdScope == nil || !pdScope.Enabled || pdScope.Prefix == nil {
+	if pdErr != nil || pdScope == nil || !pdScope.Enabled || !pdScope.PDEnabled || pdScope.Prefix == nil {
 		pdScope = nil
 	}
 	if scope == nil && pdScope == nil {
@@ -1170,7 +1170,7 @@ func (s *Server) matchScopeWithNeed(req *Packet, needPrefix bool, relay *relayCo
 				continue
 			}
 			if needPrefix {
-				if sc.Prefix != nil && sc.Prefix.Contains(sourceIP) {
+				if sc.PDEnabled && sc.Prefix != nil && sc.Prefix.Contains(sourceIP) {
 					return sc, nil
 				}
 			} else {
@@ -1186,7 +1186,7 @@ func (s *Server) matchScopeWithNeed(req *Packet, needPrefix bool, relay *relayCo
 		if !sc.Enabled {
 			continue
 		}
-		if needPrefix && sc.Prefix == nil {
+		if needPrefix && (!sc.PDEnabled || sc.Prefix == nil) {
 			continue
 		}
 		if !needPrefix && sc.Subnet == nil {
