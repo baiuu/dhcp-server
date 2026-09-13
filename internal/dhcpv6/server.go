@@ -447,6 +447,14 @@ func (s *Server) handleSolicit(ctx context.Context, req *Packet, addr *net.UDPAd
 	lease, err := s.store.AllocateV6Lease(ctx, scope, duidStr, iaidStr, "", nil, leaseTime, maxLeaseTime)
 	if err != nil {
 		s.logger.Warn("allocate v6 lease failed", "duid", duidStr, "scope", scope.Name, "err", err)
+		// RFC 8415 §18.3.9: the Advertise must carry the IA_NA with a
+		// NoAddrsAvail status so the client can stop retransmitting.
+		reply := ReplyFromRequest(req, MsgTypeAdvertise)
+		reply.Options.Add(OptServerID, s.serverDUID)
+		reply.Options.Add(OptClientID, clientID)
+		statusOpt := Option{Code: OptStatusCode, Data: BuildStatusCode(2, "no addresses available")}
+		reply.Options.Add(OptIANA, BuildIANA(iaid, 0, 0, []Option{statusOpt}))
+		s.sendReply(reply, addr, relay)
 		return
 	}
 
@@ -629,7 +637,16 @@ func (s *Server) handleSolicitPD(ctx context.Context, req *Packet, addr *net.UDP
 
 	p, err := s.store.AllocateV6Prefix(ctx, scope, duidStr, iaidStr, leaseTime, maxLeaseTime)
 	if err != nil {
-		s.logger.Warn("allocate v6 prefix failed", "err", err)
+		s.logger.Warn("allocate v6 prefix failed", "duid", duidStr, "scope", scope.Name, "err", err)
+		// RFC 8415 §18.3.9: even when no prefix can be offered, the Advertise
+		// must carry the IA_PD with a NoPrefixAvail status so the client can
+		// stop retransmitting.
+		reply := ReplyFromRequest(req, MsgTypeAdvertise)
+		reply.Options.Add(OptServerID, s.serverDUID)
+		reply.Options.Add(OptClientID, clientID)
+		statusOpt := Option{Code: OptStatusCode, Data: BuildStatusCode(6, "no prefixes available")}
+		reply.Options.Add(OptIAPD, BuildIAPD(iaid, 0, 0, []Option{statusOpt}))
+		s.sendReply(reply, addr, relay)
 		return
 	}
 
@@ -733,10 +750,6 @@ func (s *Server) handleSolicitCombined(ctx context.Context, req *Packet, addr *n
 		}
 	}
 
-	if lease == nil && prefix == nil {
-		return
-	}
-
 	reply := ReplyFromRequest(req, MsgTypeAdvertise)
 	reply.Options.Add(OptServerID, s.serverDUID)
 	reply.Options.Add(OptClientID, clientID)
@@ -755,19 +768,24 @@ func (s *Server) handleSolicitCombined(ctx context.Context, req *Packet, addr *n
 				prefix = nil
 			}
 		}
-		if lease == nil && prefix == nil {
-			return
-		}
 		rapidCommit = true
 		reply.MessageType = MsgTypeReply
 		reply.Options.Add(OptRapidCommit, []byte{})
 	}
 
+	// Per RFC 8415 §18.3.1/§18.3.9 every IA in the message must appear in the
+	// reply — with an address/prefix on success, or a status code on failure.
 	if lease != nil {
 		s.applyIA(reply, iaid, lease.IPAddr, scope)
+	} else if scope != nil {
+		statusOpt := Option{Code: OptStatusCode, Data: BuildStatusCode(2, "no addresses available")}
+		reply.Options.Add(OptIANA, BuildIANA(iaid, 0, 0, []Option{statusOpt}))
 	}
 	if prefix != nil {
 		s.applyPD(reply, pdIAID, prefix.Prefix, normalizedV6LeaseTimes(pdScope))
+	} else if pdScope != nil {
+		statusOpt := Option{Code: OptStatusCode, Data: BuildStatusCode(6, "no prefixes available")}
+		reply.Options.Add(OptIAPD, BuildIAPD(pdIAID, 0, 0, []Option{statusOpt}))
 	}
 	optScope := scope
 	if optScope == nil {

@@ -2323,7 +2323,7 @@ func allocatePrefixTx(ctx context.Context, tx pgx.Tx, scope *models.Scope) (*net
 	delegatedLen := 64
 	parentLen, _ := scope.Prefix.Mask.Size()
 	if delegatedLen <= parentLen {
-		return nil, fmt.Errorf("delegated prefix length must be larger than parent")
+		return nil, fmt.Errorf("delegated prefix /%d must be larger than the pool %s (scope %s); configure a larger PD pool such as /48", delegatedLen, scope.Prefix.String(), scope.Name)
 	}
 	subnetBits := delegatedLen - parentLen
 	if subnetBits > 48 {
