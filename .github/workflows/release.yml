@@ -62,7 +62,16 @@ jobs:
           ls -lh build/release/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build/release/*.tar.gz
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release exists, uploading assets"
+            gh release upload "$GITHUB_REF_NAME" build/release/*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" build/release/*.tar.gz \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --latest
+          fi
