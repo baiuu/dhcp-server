@@ -598,11 +598,19 @@ func hasIANAOpt(req *Packet) bool {
 
 func (s *Server) handleSolicitPD(ctx context.Context, req *Packet, addr *net.UDPAddr, relay *relayContext) {
 	scope, clientID, iaid, err := s.parseCommonPD(req, relay)
-	if err != nil {
+	if err != nil && clientID == nil {
 		s.logger.Warn("solicit pd parse", "err", err)
 		return
 	}
 	if scope == nil || !scope.Enabled || scope.Prefix == nil {
+		// No PD pool for this client: answer with NoPrefixAvail so the client
+		// stops retransmitting instead of retrying forever.
+		reply := ReplyFromRequest(req, MsgTypeAdvertise)
+		reply.Options.Add(OptServerID, s.serverDUID)
+		reply.Options.Add(OptClientID, clientID)
+		statusOpt := Option{Code: OptStatusCode, Data: BuildStatusCode(6, "no prefixes available")}
+		reply.Options.Add(OptIAPD, BuildIAPD(iaid, 0, 0, []Option{statusOpt}))
+		s.sendReply(reply, addr, relay)
 		return
 	}
 
@@ -919,7 +927,9 @@ func (s *Server) parseCommonPD(req *Packet, relay *relayContext) (*models.Scope,
 
 	scope, err := s.matchScopePD(req, relay)
 	if err != nil {
-		return nil, nil, 0, err
+		// Keep the parsed clientID/iaid so callers can still answer with a
+		// status code (e.g. NoPrefixAvail) instead of staying silent.
+		return nil, clientID, iaid, err
 	}
 	return scope, clientID, iaid, nil
 }
