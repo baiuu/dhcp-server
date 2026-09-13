@@ -92,9 +92,14 @@ type Server struct {
 	store      *store.Store
 	logger     *slog.Logger
 	conn       *net.UDPConn
+	pktConn    *ipv6.PacketConn
 	mu         sync.RWMutex
 	scopes     []*models.Scope
 	serverDUID []byte
+	// cfgIfIndex is the resolved interface index of server.interface. When
+	// non-zero, all replies are sent out through this interface instead of
+	// letting the kernel pick via the routing table.
+	cfgIfIndex int
 	quit       chan struct{}
 	stopOnce   sync.Once
 	wg         sync.WaitGroup
@@ -129,12 +134,20 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("listen udp6: %w", err)
 	}
 	s.conn = conn
+	s.pktConn = ipv6.NewPacketConn(conn)
+	if s.cfg.Server.Interface != "" {
+		if iface, err := net.InterfaceByName(s.cfg.Server.Interface); err != nil {
+			s.logger.Warn("configured interface not found, kernel picks the outgoing interface", "interface", s.cfg.Server.Interface, "err", err)
+		} else {
+			s.cfgIfIndex = iface.Index
+		}
+	}
 
 	// Join the All_DHCP_Relay_Agents_and_Servers multicast group (ff02::1:2)
 	// so that directly connected clients' Solicits reach us; without this
 	// only relayed traffic is received.
 	s.joinMulticastGroup()
-	s.logger.Info("dhcpv6 server listening", "addr", addr.String())
+	s.logger.Info("dhcpv6 server listening", "addr", addr.String(), "out_interface", s.cfg.Server.Interface)
 
 	s.wg.Add(1)
 	go s.serveLoop()
@@ -1319,7 +1332,11 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr, relay *relayContext
 		dest = &net.UDPAddr{IP: relay.relayAddr.IP, Port: 547, Zone: relay.relayAddr.Zone}
 	}
 
-	if _, err := s.conn.WriteToUDP(data, dest); err != nil {
+	var cm *ipv6.ControlMessage
+	if s.cfgIfIndex != 0 {
+		cm = &ipv6.ControlMessage{IfIndex: s.cfgIfIndex}
+	}
+	if _, err := s.pktConn.WriteTo(data, cm, dest); err != nil {
 		s.logger.Error("send v6 reply", "err", err, "dest", dest)
 	} else {
 		s.logger.Info("v6 reply sent", "dest", dest)

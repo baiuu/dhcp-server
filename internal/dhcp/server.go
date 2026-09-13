@@ -66,6 +66,10 @@ type Server struct {
 	scopes    []*models.Scope
 	allocMu   map[string]*sync.Mutex
 	allocLock sync.Mutex
+	// cfgIfIndex is the resolved interface index of server.interface. When
+	// non-zero, all replies are sent out through this interface instead of
+	// the interface the request arrived on / the routing table default.
+	cfgIfIndex int
 	// pendingDiscover buffers local-broadcast Discovers for a short window so
 	// that if a relayed copy of the same Discover arrives we can prefer the
 	// relayed copy and avoid answering the same request twice.
@@ -189,7 +193,14 @@ func (s *Server) Start(ctx context.Context) error {
 	} else {
 		s.rawFd = fd
 	}
-	s.logger.Info("dhcp server listening", "addr", s.cfg.Server.Listen)
+	if s.cfg.Server.Interface != "" {
+		if iface, err := net.InterfaceByName(s.cfg.Server.Interface); err != nil {
+			s.logger.Warn("configured interface not found, replies use the receiving interface", "interface", s.cfg.Server.Interface, "err", err)
+		} else {
+			s.cfgIfIndex = iface.Index
+		}
+	}
+	s.logger.Info("dhcp server listening", "addr", s.cfg.Server.Listen, "out_interface", s.cfg.Server.Interface)
 
 	s.wg.Add(1)
 	go s.serveLoop()
@@ -638,6 +649,16 @@ func (s *Server) logIPAllocation(ctx context.Context, scope *models.Scope, mac s
 	}
 }
 
+// outIfIndex returns the interface index replies should leave through: the
+// configured server.interface when set, otherwise the interface the request
+// arrived on (0 = let the kernel pick via the routing table).
+func (s *Server) outIfIndex(reply *Packet) int {
+	if s.cfgIfIndex != 0 {
+		return s.cfgIfIndex
+	}
+	return reply.IfIndex
+}
+
 func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 	data, err := reply.Marshal()
 	if err != nil {
@@ -649,13 +670,19 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 	giaddr := normalizeIP(reply.GIAddr)
 	ciaddr := normalizeIP(reply.CIAddr)
 
+	outIf := s.outIfIndex(reply)
+	var cm *ipv4.ControlMessage
+	if outIf != 0 {
+		cm = &ipv4.ControlMessage{IfIndex: outIf}
+	}
+
 	// Relayed request: send reply back to the relay agent, preserving the
 	// broadcast flag requested by the client (RFC 2131 compliant).
 	if !giaddr.Equal(net.IPv4zero) {
 		// Relayed traffic: always unicast to the relay's server port.
 		// The relay is responsible for forwarding to the client, even for NAK.
 		dest := &net.UDPAddr{IP: giaddr, Port: 67}
-		if _, err := s.pktConn.WriteTo(data, nil, dest); err != nil {
+		if _, err := s.pktConn.WriteTo(data, cm, dest); err != nil {
 			s.logger.Error("send reply", "err", err, "dest", dest)
 		}
 		return
@@ -671,14 +698,10 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 
 	if isBroadcast {
 		dest := &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-		var cm *ipv4.ControlMessage
-		if reply.IfIndex != 0 {
-			cm = &ipv4.ControlMessage{IfIndex: reply.IfIndex}
-		}
 		if _, err := s.pktConn.WriteTo(data, cm, dest); err != nil {
 			s.logger.Error("send reply", "err", err, "dest", dest)
 		} else {
-			s.logger.Debug("sent reply", "dest", dest, "type", messageTypeName(reply.Options.MessageType()), "ifindex", reply.IfIndex)
+			s.logger.Debug("sent reply", "dest", dest, "type", messageTypeName(reply.Options.MessageType()), "ifindex", outIf)
 		}
 		return
 	}
@@ -686,7 +709,7 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 	if !ciaddr.Equal(net.IPv4zero) {
 		// Renewing/rebinding client has an address; unicast normally.
 		dest := &net.UDPAddr{IP: ciaddr, Port: 68}
-		if _, err := s.pktConn.WriteTo(data, nil, dest); err != nil {
+		if _, err := s.pktConn.WriteTo(data, cm, dest); err != nil {
 			s.logger.Error("send reply", "err", err, "dest", dest)
 		}
 		return
@@ -698,10 +721,6 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 	if err := s.sendRawUnicast(reply); err != nil {
 		s.logger.Warn("raw unicast failed, falling back to broadcast", "mac", reply.CHAddr.String(), "err", err)
 		dest := &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-		var cm *ipv4.ControlMessage
-		if reply.IfIndex != 0 {
-			cm = &ipv4.ControlMessage{IfIndex: reply.IfIndex}
-		}
 		if _, err := s.pktConn.WriteTo(data, cm, dest); err != nil {
 			s.logger.Error("send reply", "err", err, "dest", dest)
 		}
@@ -709,19 +728,20 @@ func (s *Server) sendReply(reply *Packet, addr *net.UDPAddr) {
 }
 
 func (s *Server) sendRawUnicast(reply *Packet) error {
-	if reply.IfIndex == 0 {
-		return fmt.Errorf("no receiving interface")
+	ifIndex := s.outIfIndex(reply)
+	if ifIndex == 0 {
+		return fmt.Errorf("no outgoing interface")
 	}
-	iface, err := net.InterfaceByIndex(reply.IfIndex)
+	iface, err := net.InterfaceByIndex(ifIndex)
 	if err != nil {
 		return err
 	}
 	if len(iface.HardwareAddr) == 0 {
-		return fmt.Errorf("interface %d has no hardware address", reply.IfIndex)
+		return fmt.Errorf("interface %d has no hardware address", ifIndex)
 	}
 	srcIP := s.serverIdentifierFor(reply)
 	if srcIP == nil {
-		return fmt.Errorf("no source IP for interface %d", reply.IfIndex)
+		return fmt.Errorf("no source IP for interface %d", ifIndex)
 	}
 	payload, err := reply.Marshal()
 	if err != nil {
@@ -759,7 +779,7 @@ func (s *Server) sendRawUnicast(reply *Packet) error {
 		return fmt.Errorf("raw socket not available")
 	}
 	addr := &unix.SockaddrLinklayer{
-		Ifindex:  reply.IfIndex,
+		Ifindex:  ifIndex,
 		Protocol: htons(unix.ETH_P_IP),
 		Halen:    6,
 	}
@@ -767,7 +787,7 @@ func (s *Server) sendRawUnicast(reply *Packet) error {
 	if err := unix.Sendto(s.rawFd, buf.Bytes(), 0, addr); err != nil {
 		return err
 	}
-	s.logger.Debug("raw unicast sent", "mac", reply.CHAddr.String(), "ip", reply.YIAddr, "ifindex", reply.IfIndex)
+	s.logger.Debug("raw unicast sent", "mac", reply.CHAddr.String(), "ip", reply.YIAddr, "ifindex", ifIndex)
 	return nil
 }
 
