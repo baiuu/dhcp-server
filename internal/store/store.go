@@ -810,7 +810,7 @@ func (s *Store) LookupHostname(ctx context.Context, hostname, domain string) (v4
 		WHERE l.hostname <> '' AND l.state='active' AND l.ends_at > NOW()
 		  AND LOWER(l.hostname) = LOWER($1)
 		  AND ($2 = '' OR LOWER(s.domain_name) = LOWER($2))
-		UNION ALL
+		UNION
 		SELECT r.ip_addr FROM reservations r JOIN scopes s ON s.id = r.scope_id
 		WHERE r.hostname <> '' AND LOWER(r.hostname) = LOWER($1)
 		  AND ($2 = '' OR LOWER(s.domain_name) = LOWER($2))
@@ -837,7 +837,7 @@ func (s *Store) LookupHostname(ctx context.Context, hostname, domain string) (v4
 		WHERE l.hostname <> '' AND l.state='active' AND l.ends_at > NOW()
 		  AND LOWER(l.hostname) = LOWER($1)
 		  AND ($2 = '' OR LOWER(s.domain_name) = LOWER($2))
-		UNION ALL
+		UNION
 		SELECT r.ip_addr FROM v6_reservations r JOIN scopes s ON s.id = r.scope_id
 		WHERE r.hostname <> '' AND LOWER(r.hostname) = LOWER($1)
 		  AND ($2 = '' OR LOWER(s.domain_name) = LOWER($2))
