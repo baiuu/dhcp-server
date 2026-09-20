@@ -14,7 +14,8 @@
 ## 特性
 
 - **DHCPv4 + DHCPv6 双栈**：完整 DHCPv4 状态机 + DHCPv6 Solicit/Advertise/Request/Reply/Renew/Rebind/Release/Decline/Information-Request
-- **DHCPv6 PD（Prefix Delegation）**：支持从配置的前缀池分配 /64 子前缀
+- **DHCPv6 PD（Prefix Delegation）**：支持从配置的前缀池分配 /64 子前缀，作用域级开关控制
+- **内置 DNS 服务（可选）**：把 DHCP 租约与绑定中的主机名应答为 A/AAAA 记录，支持 PTR 反向解析，TTL 与端口可配置
 - **所有 DHCPv4/v6 Option 支持**：可三层覆盖（全局、作用域、保留 IP/Reservation）
 - **PostgreSQL 持久化**：租约、保留 IP、PD 前缀、作用域配置、审计日志全部入库
 - **现代化 Web 管理界面**：Dashboard 图表、作用域管理、保留 IP、租约详情/搜索、用户管理、Options 参考、审计日志
@@ -107,6 +108,34 @@ sudo systemctl enable --now dhcp-server
 打开 http://服务器IP:8080，使用配置的管理员账号登录。
 
 > 直接运行（开发/测试）：`sudo ./build/dhcp-server -config=configs/config.yaml`，需要 root 或 `CAP_NET_BIND_SERVICE` + `CAP_NET_RAW` 能力。
+
+## 内置 DNS 服务（可选）
+
+开启后，服务器会把 **DHCP 租约与绑定（reservation）中的主机名**直接提供为 DNS 解析，类似 dnsmasq 的租约派生记录：
+
+- **正向解析**：`pc-01` → A 记录（v4 租约）和 AAAA 记录（v6 租约）组合返回
+- **反向解析**：`1.2.168.192.in-addr.arpa` / `ip6.arpa` → PTR 记录返回主机名
+- 绑定（reservation）优先于动态租约；同时监听 UDP/TCP 53
+
+配置 `configs/config.yaml`：
+
+```yaml
+dns:
+  enabled: true            # 开关
+  listen: "0.0.0.0:53"     # 监听地址与端口
+  ttl: 300                 # 应答记录 TTL（秒）
+  suffix: "lan"            # 可选：短主机名补全为 FQDN（pc-01 → pc-01.lan）
+```
+
+验证：
+
+```bash
+dig @服务器IP pc-01 A +short      # IPv4 租约地址
+dig @服务器IP pc-01 AAAA +short   # IPv6 租约地址
+dig @服务器IP -x 192.168.1.10 +short  # PTR 反向解析主机名
+```
+
+> 注意：DNS 只应答租约/绑定中存在的主机名，不做递归转发；需要公网解析时请在内网另配递归 DNS（或把本机作为其上级的条件转发目标）。
 
 ## 高可用多节点部署
 

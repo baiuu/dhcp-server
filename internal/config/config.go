@@ -13,6 +13,7 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Auth     AuthConfig     `yaml:"auth"`
 	Cluster  ClusterConfig  `yaml:"cluster"`
+	DNS      DNSConfig      `yaml:"dns"`
 }
 
 type ServerConfig struct {
@@ -43,6 +44,18 @@ type ClusterConfig struct {
 	HeartbeatInterval  time.Duration `yaml:"heartbeat_interval"`
 	NodeTimeout        time.Duration `yaml:"node_timeout"`
 	DiscoverReplyDelay time.Duration `yaml:"discover_reply_delay"`
+}
+
+// DNSConfig 控制内置 DNS 服务：把 DHCP 租约与绑定中的主机名
+// 提供为 A/AAAA 正向解析和 PTR 反向解析。
+type DNSConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
+	// TTL 是应答记录的缓存时间（秒）。
+	TTL int `yaml:"ttl"`
+	// Suffix 可选。配置后短主机名（如 pc-01）同时以
+	// FQDN（pc-01.<suffix>）形式应答。
+	Suffix string `yaml:"suffix"`
 }
 
 func Load(path string) (*Config, error) {
@@ -88,6 +101,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Cluster.DiscoverReplyDelay < 0 {
 		cfg.Cluster.DiscoverReplyDelay = 0
+	}
+	if cfg.DNS.Listen == "" {
+		cfg.DNS.Listen = "0.0.0.0:53"
+	}
+	if cfg.DNS.TTL == 0 {
+		cfg.DNS.TTL = 300
 	}
 }
 

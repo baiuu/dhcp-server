@@ -797,6 +797,76 @@ func (s *Store) ReleaseExpiredLeases(ctx context.Context) error {
 	return err
 }
 
+// ---------- DNS Lookups ----------
+
+// LookupHostname returns the A (IPv4) and AAAA (IPv6) records for a hostname,
+// merging reservations and non-expired active leases from both families.
+// Matching is case-insensitive. An empty hostname never matches.
+func (s *Store) LookupHostname(ctx context.Context, hostname string) (v4 []net.IP, v6 []net.IP, err error) {
+	v4Rows, err := s.pool.Query(ctx, `
+		SELECT ip_addr FROM reservations WHERE hostname <> '' AND LOWER(hostname) = LOWER($1)
+		UNION ALL
+		SELECT ip_addr FROM leases WHERE hostname <> '' AND state='active' AND ends_at > NOW() AND LOWER(hostname) = LOWER($1)
+	`, hostname)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer v4Rows.Close()
+	for v4Rows.Next() {
+		var ip net.IP
+		if err := v4Rows.Scan(&ip); err != nil {
+			return nil, nil, err
+		}
+		if ip4 := to4IfPossible(ip); ip4 != nil {
+			v4 = append(v4, ip4)
+		}
+	}
+	if err := v4Rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	v6Rows, err := s.pool.Query(ctx, `
+		SELECT ip_addr FROM v6_reservations WHERE hostname <> '' AND LOWER(hostname) = LOWER($1)
+		UNION ALL
+		SELECT ip_addr FROM v6_leases WHERE hostname <> '' AND state='active' AND ends_at > NOW() AND LOWER(hostname) = LOWER($1)
+	`, hostname)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer v6Rows.Close()
+	for v6Rows.Next() {
+		var ip net.IP
+		if err := v6Rows.Scan(&ip); err != nil {
+			return nil, nil, err
+		}
+		if ip != nil && ip.To4() == nil {
+			v6 = append(v6, ip)
+		}
+	}
+	return v4, v6, v6Rows.Err()
+}
+
+// LookupPTR returns the hostname recorded for an IP address, preferring
+// reservations over active leases, across both address families.
+func (s *Store) LookupPTR(ctx context.Context, ip net.IP) (string, error) {
+	var hostname string
+	err := s.pool.QueryRow(ctx, `
+		SELECT hostname FROM (
+			SELECT hostname, 1 AS prio FROM reservations WHERE ip_addr=regexp_replace(host($1), '^::ffff:', '')::inet AND hostname <> ''
+			UNION ALL
+			SELECT hostname, 2 FROM leases WHERE ip_addr=regexp_replace(host($1), '^::ffff:', '')::inet AND hostname <> '' AND state='active' AND ends_at > NOW()
+			UNION ALL
+			SELECT hostname, 1 FROM v6_reservations WHERE ip_addr=$1::inet AND hostname <> ''
+			UNION ALL
+			SELECT hostname, 2 FROM v6_leases WHERE ip_addr=$1::inet AND hostname <> '' AND state='active' AND ends_at > NOW()
+		) t ORDER BY prio LIMIT 1
+	`, ip).Scan(&hostname)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return hostname, err
+}
+
 func (s *Store) SearchLeasesByMAC(ctx context.Context, mac string) ([]*models.Lease, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, scope_id, mac_addr, ip_addr, hostname, client_id, state, offered_at, starts_at, ends_at, created_at, updated_at

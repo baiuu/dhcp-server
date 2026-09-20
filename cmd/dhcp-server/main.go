@@ -16,6 +16,7 @@ import (
 	"github.com/dhcp-server/dhcp-server/internal/db"
 	"github.com/dhcp-server/dhcp-server/internal/dhcp"
 	"github.com/dhcp-server/dhcp-server/internal/dhcpv6"
+	"github.com/dhcp-server/dhcp-server/internal/dns"
 	"github.com/dhcp-server/dhcp-server/internal/ha"
 	"github.com/dhcp-server/dhcp-server/internal/logger"
 	"github.com/dhcp-server/dhcp-server/internal/store"
@@ -101,6 +102,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer dhcpv6Server.Stop()
+
+	// Optional DNS server answering from DHCP lease records (A/AAAA/PTR).
+	if cfg.DNS.Enabled {
+		dnsServer := dns.NewServer(cfg, st, logger)
+		if err := dnsServer.Start(ctx); err != nil {
+			logger.Error("start dns server", "err", err)
+			os.Exit(1)
+		}
+		defer dnsServer.Stop()
+	}
 
 	apiServer := api.New(cfg, st, authSvc, dhcpServer, logger)
 	httpServer := &http.Server{
