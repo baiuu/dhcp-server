@@ -285,13 +285,22 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 // lookupName resolves a query name to leased addresses. An FQDN query is
 // split into host and domain: the domain must match the scope's domain_name
 // so the answer comes from the right network. A bare short-name query (no
-// dot) is searched across all scopes regardless of domain.
+// dot) is searched across all scopes regardless of domain. When an FQDN
+// query finds nothing in its own domain, it falls back to a domain-wide
+// short-name search so hosts in scopes without a configured domain_name
+// still resolve.
 func (s *Server) lookupName(ctx context.Context, name string) (v4 []net.IP, v6 []net.IP) {
 	host, domain := splitQuery(name)
 	v4, v6, err := s.store.LookupHostname(ctx, host, domain)
 	if err != nil {
 		s.logger.Error("dns name lookup", "name", name, "err", err)
-		return nil, nil
+	}
+	if len(v4)+len(v6) > 0 || domain == "" {
+		return v4, v6
+	}
+	v4, v6, err = s.store.LookupHostname(ctx, host, "")
+	if err != nil {
+		s.logger.Error("dns name lookup fallback", "name", host, "err", err)
 	}
 	return v4, v6
 }
