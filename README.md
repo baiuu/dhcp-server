@@ -117,8 +117,10 @@ sudo systemctl enable --now dhcp-server
 - **反向解析**：`1.2.168.192.in-addr.arpa` / `ip6.arpa` → PTR 记录返回主机名（自动带上其所属作用域的域名）
 - 绑定（reservation）优先于动态租约；同时监听 UDP/TCP 53
 - **域名匹配由作用域的 `domain_name` 驱动**，无需额外配置：
-  - 查询 `pc-01.kfb.com`（带域名）→ 只应答 `domain_name` 为 `kfb.com` 的作用域记录
-  - 查询 `pc-01`（短名）→ 在所有作用域中查找并返回
+  - 查询 `pc-01.kfb.com`（带域名）→ **严格精准匹配**：只应答 `domain_name` 为 `kfb.com` 的作用域记录，不匹配或未配置该域名时返回 NXDOMAIN
+  - 查询 `pc-01`（短名）→ 在所有作用域中查找并返回（含未配置域名的作用域）
+  - A 记录只匹配 IPv4 作用域的域名，AAAA 记录只匹配 IPv6 作用域的域名（两族独立）
+- **域名唯一性约束**：同一协议族（IPv4 或 IPv6）内 `domain_name` 不允许重复，保存作用域时校验；IPv4 与 IPv6 之间允许共用同一域名（适配双栈同一网络）
 
 配置 `configs/config.yaml`：
 
