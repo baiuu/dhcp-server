@@ -114,8 +114,11 @@ sudo systemctl enable --now dhcp-server
 开启后，服务器会把 **DHCP 租约与绑定（reservation）中的主机名**直接提供为 DNS 解析，类似 dnsmasq 的租约派生记录：
 
 - **正向解析**：`pc-01` → A 记录（v4 租约）和 AAAA 记录（v6 租约）组合返回
-- **反向解析**：`1.2.168.192.in-addr.arpa` / `ip6.arpa` → PTR 记录返回主机名
+- **反向解析**：`1.2.168.192.in-addr.arpa` / `ip6.arpa` → PTR 记录返回主机名（自动带上其所属作用域的域名）
 - 绑定（reservation）优先于动态租约；同时监听 UDP/TCP 53
+- **域名匹配由作用域的 `domain_name` 驱动**，无需额外配置：
+  - 查询 `pc-01.kfb.com`（带域名）→ 只应答 `domain_name` 为 `kfb.com` 的作用域记录
+  - 查询 `pc-01`（短名）→ 在所有作用域中查找并返回
 
 配置 `configs/config.yaml`：
 
@@ -124,7 +127,6 @@ dns:
   enabled: true            # 开关
   listen: "0.0.0.0:53"     # 监听地址与端口
   ttl: 300                 # 应答记录 TTL（秒）
-  suffix: "lan"            # 可选：短主机名补全为 FQDN（pc-01 → pc-01.lan）
 ```
 
 验证：

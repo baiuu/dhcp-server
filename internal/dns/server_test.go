@@ -155,3 +155,28 @@ func TestRRPTR(t *testing.T) {
 		t.Errorf("ptr target mismatch")
 	}
 }
+
+func TestSplitQuery(t *testing.T) {
+	cases := []struct {
+		name, host, domain string
+	}{
+		{"pc-01.kfb.com", "pc-01", "kfb.com"},
+		{"pc-01", "pc-01", ""},
+		{"a.b.c.d", "a", "b.c.d"},
+	}
+	for _, c := range cases {
+		host, domain := splitQuery(c.name)
+		if host != c.host || domain != c.domain {
+			t.Errorf("splitQuery(%q) = (%q, %q), want (%q, %q)", c.name, host, domain, c.host, c.domain)
+		}
+	}
+}
+
+func TestPtrFQDN(t *testing.T) {
+	if got := ptrFQDN("pc-01", "kfb.com"); got != "pc-01.kfb.com." {
+		t.Errorf("ptrFQDN with domain = %q", got)
+	}
+	if got := ptrFQDN("pc-01", ""); got != "pc-01." {
+		t.Errorf("ptrFQDN without domain = %q", got)
+	}
+}

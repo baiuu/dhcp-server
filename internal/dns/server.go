@@ -72,7 +72,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(2)
 	go s.serveUDP(ctx)
 	go s.serveTCP(ctx)
-	s.logger.Info("dns server listening", "addr", s.cfg.DNS.Listen, "ttl", s.cfg.DNS.TTL, "suffix", s.cfg.DNS.Suffix)
+	s.logger.Info("dns server listening", "addr", s.cfg.DNS.Listen, "ttl", s.cfg.DNS.TTL)
 	return nil
 }
 
@@ -202,7 +202,7 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 			rcode = rcodeNXDomain
 			break
 		}
-		host, err := s.store.LookupPTR(ctx, ip)
+		host, domain, err := s.store.LookupPTR(ctx, ip)
 		if err != nil {
 			s.logger.Error("dns ptr lookup", "ip", ip, "err", err)
 		}
@@ -210,7 +210,7 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 			rcode = rcodeNXDomain
 			break
 		}
-		answers = append(answers, rrPTR(uint32(s.cfg.DNS.TTL), s.fqdn(host)))
+		answers = append(answers, rrPTR(uint32(s.cfg.DNS.TTL), ptrFQDN(host, domain)))
 	default:
 		// Unsupported types get a valid empty (NODATA) response.
 	}
@@ -219,34 +219,36 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 	return buildResponse(q, answers, rcode)
 }
 
-// lookupName resolves a query name to leased addresses. When a suffix is
-// configured, an FQDN query is first stripped to the short hostname; a bare
-// short name is looked up directly, with the full name as fallback.
+// lookupName resolves a query name to leased addresses. An FQDN query is
+// split into host and domain: the domain must match the scope's domain_name
+// so the answer comes from the right network. A bare short-name query (no
+// dot) is searched across all scopes regardless of domain.
 func (s *Server) lookupName(ctx context.Context, name string) (v4 []net.IP, v6 []net.IP) {
-	candidates := []string{name}
-	if suffix := strings.ToLower(s.cfg.DNS.Suffix); suffix != "" {
-		if host, ok := strings.CutSuffix(name, "."+suffix); ok && host != "" {
-			candidates = []string{host, name}
-		}
+	host, domain := splitQuery(name)
+	v4, v6, err := s.store.LookupHostname(ctx, host, domain)
+	if err != nil {
+		s.logger.Error("dns name lookup", "name", name, "err", err)
+		return nil, nil
 	}
-	for _, c := range candidates {
-		v4, v6, err := s.store.LookupHostname(ctx, c)
-		if err != nil {
-			s.logger.Error("dns name lookup", "name", c, "err", err)
-			continue
-		}
-		if len(v4)+len(v6) > 0 {
-			return v4, v6
-		}
-	}
-	return nil, nil
+	return v4, v6
 }
 
-func (s *Server) fqdn(host string) string {
-	if s.cfg.DNS.Suffix == "" || strings.Contains(host, ".") {
+// splitQuery splits a query name into host and domain parts:
+// "pc-01.kfb.com" → ("pc-01", "kfb.com"), "pc-01" → ("pc-01", "").
+func splitQuery(name string) (host, domain string) {
+	if i := strings.Index(name, "."); i > 0 {
+		return name[:i], name[i+1:]
+	}
+	return name, ""
+}
+
+// ptrFQDN assembles the PTR answer: hostname plus its scope's domain_name,
+// or just the bare hostname when the scope has no domain configured.
+func ptrFQDN(host, domain string) string {
+	if domain == "" {
 		return host + "."
 	}
-	return host + "." + s.cfg.DNS.Suffix + "."
+	return host + "." + domain + "."
 }
 
 // ---------- wire format ----------

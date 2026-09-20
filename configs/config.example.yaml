@@ -33,11 +33,10 @@ cluster:
 
 # 内置 DNS 服务：把 DHCP 租约与绑定中的主机名提供为 A/AAAA 正向解析
 # 和 PTR 反向解析（类似 dnsmasq 的租约派生 DNS 记录）。关闭则不监听。
+# 域名由作用域的 domain_name 决定：查询 pc-01.kfb.com 只应答
+# domain_name 为 kfb.com 的作用域记录；查询短名 pc-01 则在所有作用域中查找。
 dns:
   enabled: false
   listen: "0.0.0.0:53"
   # 应答记录的缓存时间（秒）
   ttl: 300
-  # 可选域名后缀。配置后短主机名（如 pc-01）同时以
-  # FQDN（pc-01.lan）形式应答；留空则只按原始主机名应答。
-  suffix: ""
