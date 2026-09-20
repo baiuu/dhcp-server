@@ -274,11 +274,7 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 		// Unsupported types get a valid empty (NODATA) response.
 	}
 
-	if rcode == rcodeNXDomain {
-		s.logger.Info("dns query not found", "name", q.name, "type", q.qtype)
-	} else {
-		s.logger.Debug("dns query", "name", q.name, "type", q.qtype, "answers", len(answers), "rcode", rcode)
-	}
+	s.logger.Debug("dns query", "name", q.name, "type", q.qtype, "answers", len(answers), "rcode", rcode)
 	return buildResponse(q, answers, rcode)
 }
 
@@ -287,8 +283,9 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 // so the answer comes from the right network. A bare short-name query (no
 // dot) is searched across all scopes regardless of domain. When an FQDN
 // query finds nothing in its own domain, it falls back to a domain-wide
-// short-name search so hosts in scopes without a configured domain_name
-// still resolve.
+// short-name search — but only when the queried domain is a configured
+// domain_name, so made-up suffixes (e.g. host.bogus.pc) correctly NXDOMAIN
+// instead of leaking the bare hostname.
 func (s *Server) lookupName(ctx context.Context, name string) (v4 []net.IP, v6 []net.IP) {
 	host, domain := splitQuery(name)
 	v4, v6, err := s.store.LookupHostname(ctx, host, domain)
@@ -297,6 +294,14 @@ func (s *Server) lookupName(ctx context.Context, name string) (v4 []net.IP, v6 [
 	}
 	if len(v4)+len(v6) > 0 || domain == "" {
 		return v4, v6
+	}
+	known, err := s.store.DomainExists(ctx, domain)
+	if err != nil {
+		s.logger.Error("dns domain check", "domain", domain, "err", err)
+		return nil, nil
+	}
+	if !known {
+		return nil, nil
 	}
 	v4, v6, err = s.store.LookupHostname(ctx, host, "")
 	if err != nil {

@@ -858,6 +858,17 @@ func (s *Store) LookupHostname(ctx context.Context, hostname, domain string) (v4
 	return v4, v6, v6Rows.Err()
 }
 
+// DomainExists reports whether any scope uses the given domain_name
+// (case-insensitive). Used by the DNS server to decide whether an FQDN
+// fallback search is meaningful for a queried domain.
+func (s *Store) DomainExists(ctx context.Context, domain string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM scopes WHERE domain_name <> '' AND LOWER(domain_name) = LOWER($1))
+	`, domain).Scan(&exists)
+	return exists, err
+}
+
 // LookupPTR returns the hostname recorded for an IP address together with the
 // domain_name of its scope, preferring reservations over active leases,
 // across both address families.
