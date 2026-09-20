@@ -18,6 +18,8 @@ import (
 
 	"github.com/dhcp-server/dhcp-server/internal/config"
 	"github.com/dhcp-server/dhcp-server/internal/store"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -36,6 +38,8 @@ type Server struct {
 	store  *store.Store
 	logger *slog.Logger
 	udp    *net.UDPConn
+	p4     *ipv4.PacketConn
+	p6     *ipv6.PacketConn
 	tcp    net.Listener
 	quit   chan struct{}
 	once   sync.Once
@@ -61,6 +65,23 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("listen dns udp: %w", err)
 	}
 	s.udp = udpConn
+
+	// Enable packet-info so replies are sent from the exact destination
+	// address and interface the client queried (RFC: the response source
+	// must match the query destination). Without this the kernel picks the
+	// outgoing interface via the routing table, which can be wrong on hosts
+	// with tunnel/VPN interfaces.
+	if udpAddr.IP.To4() != nil {
+		s.p4 = ipv4.NewPacketConn(udpConn)
+		if err := s.p4.SetControlMessage(ipv4.FlagDst|ipv4.FlagInterface, true); err != nil {
+			s.logger.Warn("dns: enable IP_PKTINFO failed, replies may use a wrong source", "err", err)
+		}
+	} else {
+		s.p6 = ipv6.NewPacketConn(udpConn)
+		if err := s.p6.SetControlMessage(ipv6.FlagDst|ipv6.FlagInterface, true); err != nil {
+			s.logger.Warn("dns: enable IPV6_PKTINFO failed, replies may use a wrong source", "err", err)
+		}
+	}
 
 	tcpLn, err := net.Listen("tcp", udpAddr.String())
 	if err != nil {
@@ -94,7 +115,18 @@ func (s *Server) serveUDP(ctx context.Context) {
 	defer s.wg.Done()
 	buf := make([]byte, 4096)
 	for {
-		n, addr, err := s.udp.ReadFromUDP(buf)
+		var (
+			n       int
+			rawAddr net.Addr
+			cm4     *ipv4.ControlMessage
+			cm6     *ipv6.ControlMessage
+			err     error
+		)
+		if s.p4 != nil {
+			n, cm4, rawAddr, err = s.p4.ReadFrom(buf)
+		} else {
+			n, cm6, rawAddr, err = s.p6.ReadFrom(buf)
+		}
 		if err != nil {
 			select {
 			case <-s.quit:
@@ -104,6 +136,11 @@ func (s *Server) serveUDP(ctx context.Context) {
 				continue
 			}
 		}
+		addr, ok := rawAddr.(*net.UDPAddr)
+		if !ok || addr == nil {
+			s.logger.Warn("dns udp packet from non-udp address", "src", rawAddr)
+			continue
+		}
 		data := append([]byte(nil), buf[:n]...)
 		go func() {
 			qctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -112,11 +149,33 @@ func (s *Server) serveUDP(ctx context.Context) {
 			if resp == nil {
 				return
 			}
-			if _, err := s.udp.WriteToUDP(resp, addr); err != nil {
-				s.logger.Error("dns udp write", "err", err, "dest", addr)
+			var werr error
+			if s.p4 != nil {
+				out := &ipv4.ControlMessage{}
+				if cm4 != nil && validReplySource(cm4.Dst) {
+					out.Src = cm4.Dst
+					out.IfIndex = cm4.IfIndex
+				}
+				_, werr = s.p4.WriteTo(resp, out, addr)
+			} else {
+				out := &ipv6.ControlMessage{}
+				if cm6 != nil && validReplySource(cm6.Dst) {
+					out.Src = cm6.Dst
+					out.IfIndex = cm6.IfIndex
+				}
+				_, werr = s.p6.WriteTo(resp, out, addr)
+			}
+			if werr != nil {
+				s.logger.Error("dns udp write", "err", werr, "dest", addr)
 			}
 		}()
 	}
+}
+
+// validReplySource reports whether addr can be used as a reply source: it
+// must be a concrete unicast address (the one the client sent its query to).
+func validReplySource(ip net.IP) bool {
+	return ip != nil && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.Equal(net.IPv4bcast)
 }
 
 func (s *Server) serveTCP(ctx context.Context) {
