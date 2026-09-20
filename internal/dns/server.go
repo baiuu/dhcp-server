@@ -274,7 +274,11 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 		// Unsupported types get a valid empty (NODATA) response.
 	}
 
-	s.logger.Debug("dns query", "name", q.name, "type", q.qtype, "answers", len(answers), "rcode", rcode)
+	if rcode == rcodeNXDomain {
+		s.logger.Info("dns query not found", "name", q.name, "type", q.qtype)
+	} else {
+		s.logger.Debug("dns query", "name", q.name, "type", q.qtype, "answers", len(answers), "rcode", rcode)
+	}
 	return buildResponse(q, answers, rcode)
 }
 
