@@ -66,6 +66,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
+          # Tags carrying a pre-release suffix (e.g. v1.1.0-beta.1) are marked
+          # as pre-release on GitHub; plain tags are published as latest.
+          PRERELEASE=""
+          LATEST="--latest"
+          case "$GITHUB_REF_NAME" in
+            *-*) PRERELEASE="--prerelease"; LATEST="" ;;
+          esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Release exists, uploading assets"
             gh release upload "$GITHUB_REF_NAME" build/release/*.tar.gz --clobber
@@ -73,5 +80,5 @@ jobs:
             gh release create "$GITHUB_REF_NAME" build/release/*.tar.gz \
               --title "$GITHUB_REF_NAME" \
               --generate-notes \
-              --latest
+              $PRERELEASE $LATEST
           fi
