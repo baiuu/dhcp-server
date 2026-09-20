@@ -858,14 +858,19 @@ func (s *Store) LookupHostname(ctx context.Context, hostname, domain string) (v4
 	return v4, v6, v6Rows.Err()
 }
 
-// DomainExists reports whether any scope uses the given domain_name
-// (case-insensitive). Used by the DNS server to decide whether an FQDN
-// fallback search is meaningful for a queried domain.
-func (s *Store) DomainExists(ctx context.Context, domain string) (bool, error) {
+// DomainNameTaken reports whether another scope of the same address family
+// already uses the given domain_name (case-insensitive). v4 and v6 scopes
+// are checked independently so a dual-stack network can share one domain
+// name across the two families.
+func (s *Store) DomainNameTaken(ctx context.Context, domain string, v6 bool, excludeID string) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM scopes WHERE domain_name <> '' AND LOWER(domain_name) = LOWER($1))
-	`, domain).Scan(&exists)
+		SELECT EXISTS(
+			SELECT 1 FROM scopes
+			WHERE domain_name <> '' AND LOWER(domain_name) = LOWER($1)
+			  AND v6 = $2 AND id <> $3
+		)
+	`, domain, v6, excludeID).Scan(&exists)
 	return exists, err
 }
 

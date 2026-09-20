@@ -282,6 +282,10 @@ func (a *API) handleCreateScope(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if msg, ok := a.validateScopeDomain(r, scope, ""); !ok {
+		a.jsonError(w, http.StatusBadRequest, msg)
+		return
+	}
 	scope.ID = uuid.New().String()
 	scope.CreatedAt = time.Now().UTC()
 	scope.UpdatedAt = scope.CreatedAt
@@ -291,6 +295,27 @@ func (a *API) handleCreateScope(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, "create", "scope", scope.ID, scope)
 	a.jsonOK(w, scope)
+}
+
+// validateScopeDomain enforces that a domain_name is unique within the same
+// address family (v4 or v6): two scopes of the same family must not share a
+// domain, otherwise DNS answers would be ambiguous.
+func (a *API) validateScopeDomain(r *http.Request, scope *models.Scope, excludeID string) (string, bool) {
+	if scope.DomainName == "" {
+		return "", true
+	}
+	taken, err := a.store.DomainNameTaken(r.Context(), scope.DomainName, scope.V6, excludeID)
+	if err != nil {
+		return err.Error(), false
+	}
+	if taken {
+		family := "IPv4"
+		if scope.V6 {
+			family = "IPv6"
+		}
+		return fmt.Sprintf("域名 %q 已被其他 %s 作用域使用，同一协议族内域名必须唯一", scope.DomainName, family), false
+	}
+	return "", true
 }
 
 func (a *API) handleUpdateScope(w http.ResponseWriter, r *http.Request) {
@@ -327,6 +352,10 @@ func (a *API) handleUpdateScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scope.ID = existing.ID
+	if msg, ok := a.validateScopeDomain(r, scope, scope.ID); !ok {
+		a.jsonError(w, http.StatusBadRequest, msg)
+		return
+	}
 	scope.CreatedAt = existing.CreatedAt
 	scope.UpdatedAt = time.Now().UTC()
 	if err := a.store.UpdateScope(r.Context(), scope); err != nil {

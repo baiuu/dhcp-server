@@ -278,34 +278,18 @@ func (s *Server) handleQuery(ctx context.Context, data []byte) []byte {
 	return buildResponse(q, answers, rcode)
 }
 
-// lookupName resolves a query name to leased addresses. An FQDN query is
-// split into host and domain: the domain must match the scope's domain_name
-// so the answer comes from the right network. A bare short-name query (no
-// dot) is searched across all scopes regardless of domain. When an FQDN
-// query finds nothing in its own domain, it falls back to a domain-wide
-// short-name search — but only when the queried domain is a configured
-// domain_name, so made-up suffixes (e.g. host.bogus.pc) correctly NXDOMAIN
-// instead of leaking the bare hostname.
+// lookupName resolves a query name to leased addresses with strict domain
+// semantics: an FQDN query only matches scopes whose domain_name equals the
+// queried domain (no fallback of any kind); a bare short-name query (no dot)
+// is searched across all scopes, including those without a domain_name.
+// IPv4 (A) and IPv6 (AAAA) records are matched independently against the
+// respective v4/v6 scopes.
 func (s *Server) lookupName(ctx context.Context, name string) (v4 []net.IP, v6 []net.IP) {
 	host, domain := splitQuery(name)
 	v4, v6, err := s.store.LookupHostname(ctx, host, domain)
 	if err != nil {
 		s.logger.Error("dns name lookup", "name", name, "err", err)
-	}
-	if len(v4)+len(v6) > 0 || domain == "" {
-		return v4, v6
-	}
-	known, err := s.store.DomainExists(ctx, domain)
-	if err != nil {
-		s.logger.Error("dns domain check", "domain", domain, "err", err)
 		return nil, nil
-	}
-	if !known {
-		return nil, nil
-	}
-	v4, v6, err = s.store.LookupHostname(ctx, host, "")
-	if err != nil {
-		s.logger.Error("dns name lookup fallback", "name", host, "err", err)
 	}
 	return v4, v6
 }
